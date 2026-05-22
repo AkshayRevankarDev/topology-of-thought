@@ -25,10 +25,38 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path('/Users/akshaymohanrevankar/Desktop/Motion/topology_of_thought')
-VENV_SITE = PROJECT_ROOT / '.venv' / 'lib' / 'python3.11' / 'site-packages'
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SESSION_PATH = PROJECT_ROOT / 'data' / 'sessions' / 'attention_is_all_you_need.json'
 TOE_SAVE_PATH = PROJECT_ROOT / 'touchdesigner' / 'topology_of_thought.toe'
+
+
+def _discover_venv_site() -> Path:
+    """Locate a TD-compatible Python 3.11 venv site-packages dir.
+
+    Preference order:
+      1. ``.venv_td/lib/python3.11/site-packages``  (built by ``setup_td.sh``)
+      2. ``.venv/lib/python3.11/site-packages``
+      3. Any ``.venv*/lib/python3.1[0-2]/site-packages`` that exists.
+    """
+    candidates = [
+        PROJECT_ROOT / '.venv_td' / 'lib' / 'python3.11' / 'site-packages',
+        PROJECT_ROOT / '.venv' / 'lib' / 'python3.11' / 'site-packages',
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    for venv_dir in sorted(PROJECT_ROOT.glob('.venv*')):
+        for py_minor in ('3.12', '3.11', '3.10'):
+            site = venv_dir / 'lib' / f'python{py_minor}' / 'site-packages'
+            if site.exists():
+                return site
+    return PROJECT_ROOT / '.venv_td' / 'lib' / 'python3.11' / 'site-packages'
+
+
+VENV_SITE = _discover_venv_site()
+if not VENV_SITE.exists():
+    print(f'[td_auto_setup] WARNING: TD-compatible venv not found at {VENV_SITE}')
+    print('[td_auto_setup] Run ./setup_td.sh from the project root to create one.')
 
 for _p in (str(PROJECT_ROOT), str(VENV_SITE)):
     if _p not in sys.path:

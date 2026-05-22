@@ -28,7 +28,7 @@ embeddings, OpenCV for the renderer. No cloud APIs.
 | `features/session_memory.py` | Atomic JSON save/load + auto-save thread. |
 | `features/zoom_node.py` | Pinch-hold to ask Ollama for a sub-graph decomposition. |
 
-## Quick start
+## Quick start (standalone — no TouchDesigner)
 
 ```bash
 # 1. Setup
@@ -44,13 +44,43 @@ embeddings, OpenCV for the renderer. No cloud APIs.
 #    (drop it into data/pdfs/ first, then edit run_pipeline.py)
 .venv/bin/python run_pipeline.py
 
-# 5. Open the interactive preview
+# 5. Open the interactive preview (mouse + webcam gestures)
 .venv/bin/python touchdesigner/standalone_preview.py
 ```
 
 A sample session built from *Attention Is All You Need* (Vaswani et al., 2017)
 ships at `data/sessions/attention_is_all_you_need.json` so the preview works
 without re-ingesting.
+
+## TouchDesigner path (optional)
+
+The same code can be driven from inside TouchDesigner as a Script TOP / Script
+CHOP network — useful if you want to composite the graph onto a live video
+feed, hook it up to MIDI controllers, or send the rendered frames over
+Spout/NDI.
+
+```bash
+# 1. Create a TD-compatible Python 3.11 venv (TD ships with Python 3.11,
+#    so its ABI doesn't match the standalone .venv if that is 3.12+).
+./setup_td.sh                     # creates .venv_td/, prints the site-pkgs path
+```
+
+In TouchDesigner:
+
+1. **Edit → Preferences → DATs → Python 64-bit Module Path** — paste the
+   `.venv_td/lib/python3.11/site-packages` path printed by `setup_td.sh`, then
+   restart TouchDesigner.
+2. Open a blank project, press **Alt+T** to bring up the Textport, and run:
+   ```python
+   exec(open('/absolute/path/to/topology_of_thought/td_setup.py').read())
+   ```
+3. The script builds the full network inside `/project1` — webcam input,
+   Script CHOP for hand tracking, Script TOP for the renderer, Execute DATs
+   for the physics engine and gesture FSM, Over/Out TOPs for compositing — and
+   saves itself as `touchdesigner/topology_of_thought.toe`.
+4. From then on, double-click `touchdesigner/OPEN_IN_TD.command` to reopen it.
+
+Full operator-by-operator wiring guide: [`touchdesigner/td_network_setup.md`](touchdesigner/td_network_setup.md).
 
 ## Controls
 
