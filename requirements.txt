@@ -1,0 +1,13 @@
+pymupdf
+requests
+rapidfuzz
+sentence-transformers
+pyaudio
+SpeechRecognition
+openai-whisper
+genanki
+numpy
+opencv-python
+mediapipe
+torch
+scipy

@@ -1,0 +1,444 @@
+"""
+td_auto_setup.py — Build the full Topology of Thought TD network from scratch.
+
+HOW TO RUN — paste this ONE line into the TD Textport (Alt+T):
+
+    exec(open('/Users/akshaymohanrevankar/Desktop/Motion/topology_of_thought/touchdesigner/td_auto_setup.py').read())
+
+What it does:
+  1. Creates every required operator inside /project1
+  2. Populates nodes/edges Table DATs from the saved JSON session
+  3. Writes all Python scripts into their Text DATs
+  4. Wires Script CHOP → hand_track_script DAT
+     Wires Script TOP  → render_script DAT
+  5. Connects operators (webcam → over → out, render → over)
+  6. Saves the project as touchdesigner/topology_of_thought.toe
+
+TD version: 2025.32460
+Python: 3.11 (TD's built-in), venv packages visible via sys.path insert
+"""
+
+import sys
+import json
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path('/Users/akshaymohanrevankar/Desktop/Motion/topology_of_thought')
+VENV_SITE = PROJECT_ROOT / '.venv' / 'lib' / 'python3.11' / 'site-packages'
+SESSION_PATH = PROJECT_ROOT / 'data' / 'sessions' / 'attention_is_all_you_need.json'
+TOE_SAVE_PATH = PROJECT_ROOT / 'touchdesigner' / 'topology_of_thought.toe'
+
+for _p in (str(PROJECT_ROOT), str(VENV_SITE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# ---------------------------------------------------------------------------
+# Base container — build everything inside /project1
+# ---------------------------------------------------------------------------
+BASE = op('/project1')
+
+def _make(op_type, name, x=0, y=0):
+    """Destroy any existing operator with *name* then create a fresh one.
+
+    Args:
+        op_type: TD operator type global (e.g. tableDAT, scriptCHOP).
+        name: Operator name string.
+        x: Node X position in the network editor.
+        y: Node Y position in the network editor.
+
+    Returns:
+        The newly created TD operator.
+    """
+    existing = BASE.op(name)
+    if existing is not None:
+        existing.destroy()
+    n = BASE.create(op_type, name)
+    n.nodeX = x
+    n.nodeY = y
+    return n
+
+
+def _set_par(op_obj, par_name, value, *fallback_names):
+    """Set a TD parameter by name, silently trying fallbacks if the first fails.
+
+    Prints a diagnostic listing all available parameter names when every
+    attempt fails so the user knows what name to use.
+
+    Args:
+        op_obj: The TD operator whose parameter to set.
+        par_name: Primary parameter name to try.
+        value: Value to assign.
+        *fallback_names: Additional names to try in order.
+    """
+    for name in (par_name,) + fallback_names:
+        try:
+            setattr(op_obj.par, name, value)
+            return
+        except Exception:
+            continue
+    # All names failed — print available pars so user can find the right name.
+    available = [p.name for p in op_obj.pars()]
+    print(f'[td_auto_setup] WARNING: could not set {op_obj.name}.par.{par_name} = {value!r}')
+    print(f'  Available parameters: {available[:30]}')
+    print(f'  Set it manually in TD: op("{op_obj.name}").par.<name> = {value!r}')
+
+# ---------------------------------------------------------------------------
+# 1. Load session data from JSON
+# ---------------------------------------------------------------------------
+if not SESSION_PATH.exists():
+    raise FileNotFoundError(
+        f"Session not found: {SESSION_PATH}\n"
+        "Run `python run_pipeline.py` from the project terminal first."
+    )
+
+with open(SESSION_PATH, 'r', encoding='utf-8') as _f:
+    _session = json.load(_f)
+
+_nodes = _session.get('nodes', [])
+_edges = _session.get('edges', [])
+print(f'[td_auto_setup] Loaded {len(_nodes)} nodes, {len(_edges)} edges')
+
+# ---------------------------------------------------------------------------
+# 2. Table DATs — nodes and edges
+# ---------------------------------------------------------------------------
+nodes_tbl = _make(tableDAT, 'nodes_table', x=-600, y=300)
+nodes_tbl.clear()
+nodes_tbl.appendRow(['id', 'label', 'confidence', 'x', 'y', 'source_paper', 'page_refs'])
+for _n in _nodes:
+    nodes_tbl.appendRow([
+        str(_n.get('id', ''))[:12],
+        str(_n.get('label', '')),
+        f"{float(_n.get('confidence', 1.0)):.3f}",
+        f"{float(_n.get('x', 0.0)):.1f}",
+        f"{float(_n.get('y', 0.0)):.1f}",
+        str(_n.get('source_paper', '')),
+        str(_n.get('page_refs', [])),
+    ])
+
+edges_tbl = _make(tableDAT, 'edges_table', x=-600, y=100)
+edges_tbl.clear()
+edges_tbl.appendRow(['id', 'source_id', 'target_id', 'relation', 'weight', 'confidence'])
+for _e in _edges:
+    edges_tbl.appendRow([
+        str(_e.get('id', ''))[:12],
+        str(_e.get('source_id', ''))[:12],
+        str(_e.get('target_id', ''))[:12],
+        str(_e.get('relation', 'related_to')),
+        f"{float(_e.get('weight', 1.0)):.3f}",
+        f"{float(_e.get('confidence', 1.0)):.3f}",
+    ])
+
+print(f'[td_auto_setup] Table DATs populated')
+
+# ---------------------------------------------------------------------------
+# 3. State Text DAT  (current interaction mode)
+# ---------------------------------------------------------------------------
+mode_dat = _make(textDAT, 'current_mode', x=-600, y=-100)
+mode_dat.text = 'idle'
+
+# ---------------------------------------------------------------------------
+# 4. Hand-tracking script DAT + Script CHOP
+# ---------------------------------------------------------------------------
+_hand_script_code = f'''# Hand tracking cook function — referenced by hand_tracker Script CHOP
+import sys as _sys
+_root = r'{PROJECT_ROOT}'
+_venv = r'{VENV_SITE}'
+for _p in (_root, _venv):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+def start(CHOP):
+    """Called when the Script CHOP cooks for the first time."""
+    from touchdesigner.hand_tracking import startup
+    startup(camera_index=0)
+
+def cook(CHOP):
+    """Called every frame to update hand landmark channels."""
+    from touchdesigner.hand_tracking import cook as _cook
+    _cook(CHOP)
+
+def stop(CHOP):
+    """Called when TD exits or the CHOP is deactivated."""
+    from touchdesigner.hand_tracking import shutdown
+    shutdown()
+'''
+
+hand_script_dat = _make(textDAT, 'hand_track_script', x=-400, y=400)
+hand_script_dat.text = _hand_script_code
+
+hand_chop = _make(scriptCHOP, 'hand_tracker', x=-200, y=400)
+# 'cooktype' does not exist in TD 2025 — Script CHOP always cooks when active.
+# Link Script CHOP to its script DAT (try all known parameter name variants).
+_set_par(hand_chop, 'dat', hand_script_dat, 'scriptdat', 'Dat', 'scriptDAT')
+
+print('[td_auto_setup] hand_tracker Script CHOP created')
+
+# ---------------------------------------------------------------------------
+# 5. Webcam Video Device In TOP
+# ---------------------------------------------------------------------------
+cam_top = _make(videodeviceinTOP, 'webcam_in', x=-600, y=-300)
+_set_par(cam_top, 'device',  0,   'Device')
+_set_par(cam_top, 'resx',    640, 'resolutionw', 'width')
+_set_par(cam_top, 'resy',    480, 'resolutionh', 'height')
+
+print('[td_auto_setup] webcam_in TOP created')
+
+# ---------------------------------------------------------------------------
+# 6. Graph renderer script DAT + Script TOP
+# ---------------------------------------------------------------------------
+_render_script_code = f'''# Graph renderer cook function — referenced by graph_render Script TOP
+import sys as _sys
+_root = r'{PROJECT_ROOT}'
+_venv = r'{VENV_SITE}'
+for _p in (_root, _venv):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+def cook(scriptOp):
+    """Render the knowledge graph to this TOP each frame."""
+    graph = op('/project1').fetch('graph', None)
+    if graph is None:
+        return
+    scriptOp.storage['graph'] = graph
+    from touchdesigner.graph_renderer import cook as _rcook
+    _rcook(scriptOp)
+'''
+
+render_script_dat = _make(textDAT, 'render_script', x=-200, y=0)
+render_script_dat.text = _render_script_code
+
+render_top = _make(scriptTOP, 'graph_render', x=0, y=0)
+_set_par(render_top, 'resolutionw', 1920, 'resx', 'width')
+_set_par(render_top, 'resolutionh', 1080, 'resy', 'height')
+_set_par(render_top, 'pixelformat', 'rgba32float', 'format', 'Pixelformat')
+_set_par(render_top, 'dat', render_script_dat, 'scriptdat', 'Dat')
+
+print('[td_auto_setup] graph_render Script TOP created')
+
+# ---------------------------------------------------------------------------
+# 7. Physics + session-loader Execute DAT (onStart)
+# ---------------------------------------------------------------------------
+_physics_exec_code = f'''# Physics engine — loads graph on startup, runs simulation in background thread
+import sys as _sys
+_root = r'{PROJECT_ROOT}'
+_venv = r'{VENV_SITE}'
+for _p in (_root, _venv):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+def onStart():
+    import random
+    import json
+    from pathlib import Path
+    from core.graph_state import GraphState
+    from touchdesigner.physics import PhysicsEngine
+
+    session_path = Path(r'{SESSION_PATH}')
+    with open(session_path, 'r') as f:
+        data = json.load(f)
+
+    graph = GraphState.from_dict(data)
+
+    # Random initial scatter so nodes are not all at origin.
+    for node in graph.nodes:
+        node.x = random.uniform(100, 1820)
+        node.y = random.uniform(100, 980)
+        node.vx = 0.0
+        node.vy = 0.0
+
+    engine = PhysicsEngine(
+        graph,
+        canvas_width=1920,
+        canvas_height=1080,
+        repulsion=4500,
+        spring_k=0.045,
+        spring_l=160,
+        damping=0.83,
+        gravity=0.009,
+        ticks_per_second=60,
+    )
+    engine.start()
+
+    op('/project1').store('graph', graph)
+    op('/project1').store('physics_engine', engine)
+    print(f'[physics_exec] Graph ready: {{len(graph.nodes)}} nodes, {{len(graph.edges)}} edges')
+
+def onExit():
+    engine = op('/project1').fetch('physics_engine', None)
+    if engine is not None:
+        engine.stop()
+        print('[physics_exec] Physics engine stopped.')
+
+def onFrameStart(frame):
+    pass  # Physics runs in its own daemon thread; nothing needed per-frame.
+'''
+
+physics_exec = _make(executeDAT, 'physics_exec', x=-400, y=-300)
+physics_exec.text = _physics_exec_code
+_set_par(physics_exec, 'active',     True)
+_set_par(physics_exec, 'start',      True,  'onstart',  'Start')
+_set_par(physics_exec, 'exit',       True,  'onexit',   'Exit')
+_set_par(physics_exec, 'framestart', False, 'onframestart')
+
+print('[td_auto_setup] physics_exec Execute DAT created')
+
+# ---------------------------------------------------------------------------
+# 8. Gesture engine Execute DAT (onFrameStart)
+# ---------------------------------------------------------------------------
+_gesture_exec_code = f'''# Gesture engine — runs every frame to dispatch pinch/swipe events
+import sys as _sys
+_root = r'{PROJECT_ROOT}'
+_venv = r'{VENV_SITE}'
+for _p in (_root, _venv):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+_engine = None        # module-level singleton
+_import_ok = None     # None = not yet tried, True = ok, False = failed once
+
+def _try_import():
+    """Import gesture/hand modules once; return True on success, False on failure.
+    Prints the error exactly once so it does not spam the Textport every frame.
+    """
+    global _import_ok, _engine
+    if _import_ok is not None:
+        return _import_ok
+    try:
+        from touchdesigner.gesture_engine import GestureEngine
+        _engine = GestureEngine()
+        _import_ok = True
+        print('[gesture_exec] GestureEngine initialised.')
+    except Exception as _e:
+        _import_ok = False
+        print(f'[gesture_exec] WARNING: could not import gesture/hand modules: {{_e}}')
+        print('[gesture_exec] Hand gestures disabled until TD Python Module Path is set.')
+        print('[gesture_exec] Edit → Preferences → DATs → Python 64-bit Module Path:')
+        print(f'[gesture_exec]   {_venv}')
+        print('[gesture_exec] Then restart TD.')
+    return _import_ok
+
+def onStart():
+    _try_import()
+
+def onFrameStart(frame):
+    if not _try_import():
+        return  # already printed error once; silently skip every subsequent frame
+
+    # Safe import — modules are already loaded after _try_import() succeeded
+    from touchdesigner.hand_tracking import _latest_hands
+    events = _engine.update(list(_latest_hands))
+
+    graph    = op('/project1').fetch('graph', None)
+    mode_dat = op('/project1/current_mode')
+
+    for ev in events:
+        if ev.name == 'pinch_start':
+            if mode_dat is not None:
+                mode_dat.text = 'pinching'
+
+        elif ev.name == 'pinch_end':
+            if mode_dat is not None:
+                mode_dat.text = 'idle'
+
+        elif ev.name.startswith('swipe_'):
+            if mode_dat is not None:
+                mode_dat.text = ev.name   # e.g. 'swipe_left'
+
+        elif ev.name == 'open_palm':
+            if mode_dat is not None:
+                mode_dat.text = 'open_palm'
+'''
+
+gesture_exec = _make(executeDAT, 'gesture_exec', x=-200, y=-300)
+gesture_exec.text = _gesture_exec_code
+_set_par(gesture_exec, 'active',     True)
+_set_par(gesture_exec, 'start',      True,  'onstart',  'Start')
+_set_par(gesture_exec, 'framestart', True,  'onframestart', 'Framestart')
+
+print('[td_auto_setup] gesture_exec Execute DAT created')
+
+# ---------------------------------------------------------------------------
+# 9. Over TOP (graph render composited over webcam)
+# ---------------------------------------------------------------------------
+over_top = _make(overTOP, 'composite', x=200, y=0)
+
+# ---------------------------------------------------------------------------
+# 10. Null TOP (clean monitoring tap before output)
+# ---------------------------------------------------------------------------
+monitor_top = _make(nullTOP, 'monitor', x=350, y=0)
+
+# ---------------------------------------------------------------------------
+# 11. Out TOP (final output)
+# ---------------------------------------------------------------------------
+out_top = _make(outTOP, 'output', x=500, y=0)
+
+print('[td_auto_setup] All operators created')
+
+# ---------------------------------------------------------------------------
+# 12. Wire connections
+# ---------------------------------------------------------------------------
+# graph_render → composite[0] (background layer)
+try:
+    over_top.inputConnectors[0].connect(render_top)
+except Exception as _e:
+    print(f'[td_auto_setup] WARNING composite[0] connect: {_e}')
+
+# webcam_in → composite[1] (foreground layer, shows hand skeleton overlay)
+try:
+    over_top.inputConnectors[1].connect(cam_top)
+except Exception as _e:
+    print(f'[td_auto_setup] WARNING composite[1] connect: {_e}')
+
+# composite → monitor → output
+try:
+    monitor_top.inputConnectors[0].connect(over_top)
+    out_top.inputConnectors[0].connect(monitor_top)
+except Exception as _e:
+    print(f'[td_auto_setup] WARNING output chain connect: {_e}')
+
+print('[td_auto_setup] Operators wired')
+
+# ---------------------------------------------------------------------------
+# 13. Layout nodes cleanly in the network editor
+# ---------------------------------------------------------------------------
+_positions = {
+    'nodes_table':      (-600, 300),
+    'edges_table':      (-600, 100),
+    'current_mode':     (-600, -100),
+    'webcam_in':        (-600, -300),
+    'hand_track_script':(-400,  400),
+    'hand_tracker':     (-200,  400),
+    'render_script':    (-200,  200),
+    'graph_render':     (   0,  200),
+    'physics_exec':     (-400, -200),
+    'gesture_exec':     (-200, -200),
+    'composite':        ( 200,  200),
+    'monitor':          ( 350,  200),
+    'output':           ( 500,  200),
+}
+for _name, (_x, _y) in _positions.items():
+    _op = BASE.op(_name)
+    if _op is not None:
+        _op.nodeX = _x * 2   # TD uses larger pixel units
+        _op.nodeY = _y * 2
+
+# ---------------------------------------------------------------------------
+# 14. Save the project as a .toe file
+# ---------------------------------------------------------------------------
+_toe_path = str(TOE_SAVE_PATH)
+try:
+    project.save(_toe_path)
+    print(f'[td_auto_setup] Project saved: {_toe_path}')
+except Exception as _e:
+    print(f'[td_auto_setup] WARNING: project.save() failed: {_e}')
+    print('  → File → Save As manually to save the .toe')
+
+print('')
+print('=' * 55)
+print('  Topology of Thought — TD network ready')
+print(f'  {len(_nodes)} nodes  |  {len(_edges)} edges')
+print('  Physics starts automatically on next TD launch.')
+print('  Open OPEN_IN_TD.command to reopen this project.')
+print('=' * 55)
