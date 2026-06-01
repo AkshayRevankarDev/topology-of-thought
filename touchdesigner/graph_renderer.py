@@ -4,6 +4,13 @@ graph_renderer.py — Graph rendering for TouchDesigner Script TOP + standalone 
 Aesthetic: white-on-dark, minimal, monospace labels, corner brackets, confidence
 coloring (dim blue-grey → bright white).  No glow, no bloom.
 
+AR mode (ar=True)
+-----------------
+Background is fully transparent (alpha=0).  Only nodes, edges, and labels are
+drawn.  Intended for compositing over a live webcam feed so nodes appear to
+float in physical space.  Each node is depth-scaled by its distance from the
+frame centre, giving a perspective-like depth illusion.
+
 TouchDesigner usage
 -------------------
 The ``cook(scriptOp)`` function writes an RGBA float32 numpy array to the
@@ -143,28 +150,42 @@ def _draw_brackets(
     r: int,
     color: Tuple[int, int, int],
 ) -> None:
-    """Draw four L-shaped corner brackets around a node.
+    """Draw four L-shaped corner brackets (BGR canvas)."""
+    _draw_brackets_bgra(canvas, cx, cy, r, color, alpha=255)
+
+
+def _draw_brackets_bgra(
+    canvas: np.ndarray,
+    cx: int,
+    cy: int,
+    r: int,
+    color: Tuple[int, int, int],
+    alpha: int = 255,
+) -> None:
+    """Draw four L-shaped corner brackets around a node on a BGRA canvas.
 
     Args:
-        canvas: BGR image to draw on (mutated in-place).
+        canvas: BGRA image to draw on (mutated in-place).
         cx: Node centre x.
         cy: Node centre y.
         r: Node circle radius.
-        color: BGR bracket colour.
+        color: BGR bracket colour (alpha applied separately).
+        alpha: Alpha value 0-255 for the brackets.
     """
     p = r + BRACKET_PAD
     L = BRACKET_LEN
     t = BRACKET_THICK
     aa = cv2.LINE_AA
+    c4 = (*color, alpha)  # BGRA tuple
 
-    cv2.line(canvas, (cx-p,   cy-p),   (cx-p+L, cy-p  ), color, t, aa)
-    cv2.line(canvas, (cx-p,   cy-p),   (cx-p,   cy-p+L), color, t, aa)
-    cv2.line(canvas, (cx+p,   cy-p),   (cx+p-L, cy-p  ), color, t, aa)
-    cv2.line(canvas, (cx+p,   cy-p),   (cx+p,   cy-p+L), color, t, aa)
-    cv2.line(canvas, (cx-p,   cy+p),   (cx-p+L, cy+p  ), color, t, aa)
-    cv2.line(canvas, (cx-p,   cy+p),   (cx-p,   cy+p-L), color, t, aa)
-    cv2.line(canvas, (cx+p,   cy+p),   (cx+p-L, cy+p  ), color, t, aa)
-    cv2.line(canvas, (cx+p,   cy+p),   (cx+p,   cy+p-L), color, t, aa)
+    cv2.line(canvas, (cx-p, cy-p), (cx-p+L, cy-p  ), c4, t, aa)
+    cv2.line(canvas, (cx-p, cy-p), (cx-p,   cy-p+L), c4, t, aa)
+    cv2.line(canvas, (cx+p, cy-p), (cx+p-L, cy-p  ), c4, t, aa)
+    cv2.line(canvas, (cx+p, cy-p), (cx+p,   cy-p+L), c4, t, aa)
+    cv2.line(canvas, (cx-p, cy+p), (cx-p+L, cy+p  ), c4, t, aa)
+    cv2.line(canvas, (cx-p, cy+p), (cx-p,   cy+p-L), c4, t, aa)
+    cv2.line(canvas, (cx+p, cy+p), (cx+p-L, cy+p  ), c4, t, aa)
+    cv2.line(canvas, (cx+p, cy+p), (cx+p,   cy+p-L), c4, t, aa)
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +198,9 @@ def render_frame(
     height: int = 720,
     selected_id: Optional[str] = None,
     show_labels: bool = True,
+    ar: bool = False,
 ) -> np.ndarray:
-    """Render the knowledge graph to a BGR uint8 numpy array.
+    """Render the knowledge graph to a BGRA uint8 numpy array.
 
     Args:
         graph: The GraphState to draw.
@@ -187,11 +209,20 @@ def render_frame(
         selected_id: ID of the currently selected/dragged node (gets a
             highlight ring), or None.
         show_labels: Whether to render text labels below nodes.
+        ar: If True, background is fully transparent (alpha=0) so the frame
+            can be composited over a webcam feed.  Nodes near the frame edges
+            are depth-scaled slightly smaller to give a 3D depth illusion.
 
     Returns:
-        ``(height, width, 3)`` uint8 BGR numpy array.
+        ``(height, width, 4)`` uint8 BGRA numpy array.
     """
-    canvas = np.full((height, width, 3), BG_COLOR, dtype=np.uint8)
+    # Always work in BGRA so we can set per-pixel alpha for AR mode.
+    if ar:
+        canvas = np.zeros((height, width, 4), dtype=np.uint8)  # transparent bg
+    else:
+        canvas = np.zeros((height, width, 4), dtype=np.uint8)
+        canvas[:, :, :3] = BG_COLOR
+        canvas[:, :,  3] = 255  # fully opaque background
 
     nodes = graph.nodes
     edges = graph.edges
@@ -205,11 +236,40 @@ def render_frame(
     PHYS_W = 1920.0
     PHYS_H = 1080.0
 
+    # Centre of frame — used for AR depth illusion
+    cx_frame = width  / 2.0
+    cy_frame = height / 2.0
+    max_dist = (cx_frame ** 2 + cy_frame ** 2) ** 0.5
+
     pos: Dict[str, Tuple[int, int]] = {}
+    depth_scale: Dict[str, float] = {}
     for node in nodes:
         px = int(np.clip(node.x / PHYS_W * width,  0, width  - 1))
         py = int(np.clip(node.y / PHYS_H * height, 0, height - 1))
         pos[node.id] = (px, py)
+        if ar:
+            # Nodes near the centre appear "closer" (larger); edge nodes appear
+            # further (smaller).  Scale range: 0.65 (corner) → 1.15 (centre).
+            dist = ((px - cx_frame) ** 2 + (py - cy_frame) ** 2) ** 0.5
+            t = dist / max_dist          # 0 = centre, 1 = corner
+            depth_scale[node.id] = 1.15 - t * 0.50
+        else:
+            depth_scale[node.id] = 1.0
+
+    # Helper: draw on BGRA canvas with full alpha on drawn pixels
+    def _line(p1, p2, color_bgr, alpha_val, thick=1):
+        # Draw on a scratch BGR image then stamp onto BGRA canvas
+        color_bgra = (*color_bgr, alpha_val)
+        cv2.line(canvas, p1, p2, color_bgra, thick, cv2.LINE_AA)
+
+    def _circle(center, radius, color_bgr, alpha_val, filled):
+        color_bgra = (*color_bgr, alpha_val)
+        thickness = -1 if filled else 1
+        cv2.circle(canvas, center, radius, color_bgra, thickness, cv2.LINE_AA)
+
+    def _text(txt, org, color_bgr, alpha_val, scale, thick):
+        color_bgra = (*color_bgr, alpha_val)
+        cv2.putText(canvas, txt, org, FONT, scale, color_bgra, thick, cv2.LINE_AA)
 
     # --- Edges ---
     for edge in edges:
@@ -217,9 +277,10 @@ def render_frame(
         p2 = pos.get(edge.target_id)
         if p1 is None or p2 is None:
             continue
-        alpha = max(EDGE_ALPHA_MIN, edge.confidence * 0.5)
-        ec = tuple(int(c * alpha) for c in EDGE_COLOR)
-        cv2.line(canvas, p1, p2, ec, 1, cv2.LINE_AA)
+        alpha_f = max(EDGE_ALPHA_MIN, edge.confidence * 0.5)
+        ec = tuple(int(c * alpha_f) for c in EDGE_COLOR)
+        edge_alpha = int(180 * alpha_f) if ar else 255
+        _line(p1, p2, ec, edge_alpha)
 
     # --- Nodes ---
     for node in nodes:
@@ -227,40 +288,39 @@ def render_frame(
         if p is None:
             continue
         cx, cy = p
-        r = _node_radius(deg.get(node.id, 0), max_deg)
+        ds = depth_scale.get(node.id, 1.0)
+        r = max(2, int(_node_radius(deg.get(node.id, 0), max_deg) * ds))
         color = _conf_color(node.confidence)
         is_sel = (node.id == selected_id) or node.selected
+        node_alpha = 255
 
         # Filled circle
-        cv2.circle(canvas, (cx, cy), r, color, -1, cv2.LINE_AA)
+        _circle((cx, cy), r, color, node_alpha, filled=True)
 
         # Selection ring
         if is_sel:
-            cv2.circle(canvas, (cx, cy), r + 3, SEL_RING_COLOR, 1, cv2.LINE_AA)
+            _circle((cx, cy), r + 3, SEL_RING_COLOR, node_alpha, filled=False)
 
         # Corner brackets
-        _draw_brackets(
-            canvas, cx, cy, r,
-            BRACKET_SEL_COLOR if is_sel else BRACKET_COLOR,
-        )
+        _draw_brackets_bgra(canvas, cx, cy, r,
+                             BRACKET_SEL_COLOR if is_sel else BRACKET_COLOR,
+                             alpha=200 if ar else 255)
 
         # Label — drawn to the RIGHT of the dot, vertically centred
         if show_labels and node.label:
             raw = node.label
             label = raw[:18] + "..." if len(raw) > 18 else raw
-            (tw, th), _ = cv2.getTextSize(label, FONT, FONT_SCALE, FONT_THICK)
+            font_scale = max(0.6, FONT_SCALE * ds)
+            (tw, th), _ = cv2.getTextSize(label, FONT, font_scale, FONT_THICK)
             lx = cx + r + 8
             ly = cy + th // 2
             # Shadow
-            cv2.putText(
-                canvas, label, (lx + 1, ly + 1),
-                FONT, FONT_SCALE, LABEL_SHADOW, FONT_THICK + 1, cv2.LINE_AA,
-            )
+            _text(label, (lx + 1, ly + 1), LABEL_SHADOW,
+                  150 if ar else 255, font_scale, FONT_THICK + 1)
             # Text
-            cv2.putText(
-                canvas, label, (lx, ly),
-                FONT, FONT_SCALE, LABEL_COLOR, FONT_THICK, cv2.LINE_AA,
-            )
+            label_alpha = 230 if ar else 255
+            _text(label, (lx, ly), LABEL_COLOR,
+                  label_alpha, font_scale, FONT_THICK)
 
     return canvas
 
@@ -269,6 +329,7 @@ def render_to_rgba(
     graph: GraphState,
     width: int = 1920,
     height: int = 1080,
+    ar: bool = True,
     **kwargs,
 ) -> np.ndarray:
     """Render the graph and return a float32 RGBA array for TouchDesigner.
@@ -279,13 +340,17 @@ def render_to_rgba(
         graph: The GraphState to render.
         width: Canvas width.
         height: Canvas height.
+        ar: If True (default) the background is transparent so the graph can
+            be composited over a webcam feed with additive/over blending.
+            Set False for opaque dark-background standalone rendering.
         **kwargs: Forwarded to :func:`render_frame`.
 
     Returns:
         ``(height, width, 4)`` float32 numpy array with RGBA channels.
     """
-    bgr = render_frame(graph, width=width, height=height, **kwargs)
-    rgba_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
+    bgra = render_frame(graph, width=width, height=height, ar=ar, **kwargs)
+    # render_frame returns BGRA; swap B↔R to get RGBA for TD.
+    rgba_u8 = bgra[:, :, [2, 1, 0, 3]]
     # TD Script TOP expects row 0 at the BOTTOM (OpenGL convention).
     # OpenCV/NumPy have row 0 at the TOP, so flip vertically.
     rgba_u8 = np.flipud(rgba_u8)
