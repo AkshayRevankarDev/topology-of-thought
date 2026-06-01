@@ -40,38 +40,54 @@ from core.graph_state import GraphState, Node
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Colour palette (all BGR uint8)
+# IRON MAN HUD  —  Neon electric-blue palette (all BGR uint8)
 # ---------------------------------------------------------------------------
-BG_COLOR          = (12, 10, 10)          # #0a0a0c
-NODE_COLOR_LO     = (55, 50, 65)          # low-confidence node
-NODE_COLOR_HI     = (232, 228, 238)       # high-confidence node
-EDGE_COLOR        = (70, 68, 80)          # default edge
-LABEL_COLOR       = (148, 143, 158)       # label text
-LABEL_SHADOW      = (5,  4,  6)           # label drop-shadow
-BRACKET_COLOR     = (52, 50, 65)          # idle bracket
-BRACKET_SEL_COLOR = (185, 180, 215)       # selected bracket / ring
-SEL_RING_COLOR    = (195, 190, 220)
+BG_COLOR           = (5,   3,   8)         # near-black (opaque mode only)
+
+# Node neon layers  (BGR)
+NEON_FAR_GLOW      = ( 80,  30,   0)       # outermost dim blue haze
+NEON_MID_GLOW      = (180,  80,   5)       # mid glow ring
+NEON_RING          = (255, 160,  20)       # main bright ring  (sky-blue)
+NEON_HIGHLIGHT     = (255, 230,  80)       # inner highlight arc (cyan)
+NEON_CORE          = (255, 255, 200)       # hot white-blue core
+
+# Confidence gradient: low → high
+NODE_COLOR_LO      = ( 60,  20,   0)       # dim blue — low confidence
+NODE_COLOR_HI      = (255, 180,  30)       # electric cyan — high confidence
+
+# Edges
+EDGE_NEON          = (160,  70,   5)       # dim cyan edge line
+EDGE_GLOW          = ( 60,  20,   0)       # edge glow halo
+
+# Labels
+LABEL_COLOR        = (255, 210,  70)       # bright cyan-white text
+LABEL_GLOW         = ( 80,  30,   0)       # label outer glow
+
+# Brackets / HUD corners
+BRACKET_COLOR      = (140,  60,   5)       # idle bracket (dim blue)
+BRACKET_SEL_COLOR  = (255, 240, 100)       # selected (hot white-cyan)
+SEL_RING_COLOR     = (255, 255, 180)       # selection pulse ring
 
 # ---------------------------------------------------------------------------
 # Geometry constants
 # ---------------------------------------------------------------------------
-NODE_R_MIN    = 5
-NODE_R_MAX    = 16
-BRACKET_LEN   = 9
-BRACKET_PAD   = 5       # gap between node edge and bracket inner corner
+NODE_R_MIN    = 6
+NODE_R_MAX    = 20
+BRACKET_LEN   = 10
+BRACKET_PAD   = 6
 BRACKET_THICK = 1
 
 # ---------------------------------------------------------------------------
 # Typography
 # ---------------------------------------------------------------------------
-FONT       = cv2.FONT_HERSHEY_PLAIN   # closest to monospace in OpenCV
+FONT       = cv2.FONT_HERSHEY_PLAIN
 FONT_SCALE = 0.95
 FONT_THICK = 1
 
 # ---------------------------------------------------------------------------
 # Edge rendering
 # ---------------------------------------------------------------------------
-EDGE_ALPHA_MIN = 0.35
+EDGE_ALPHA_MIN = 0.30
 
 
 # ---------------------------------------------------------------------------
@@ -216,111 +232,143 @@ def render_frame(
     Returns:
         ``(height, width, 4)`` uint8 BGRA numpy array.
     """
-    # Always work in BGRA so we can set per-pixel alpha for AR mode.
-    if ar:
-        canvas = np.zeros((height, width, 4), dtype=np.uint8)  # transparent bg
-    else:
-        canvas = np.zeros((height, width, 4), dtype=np.uint8)
+    # Always BGRA canvas
+    canvas = np.zeros((height, width, 4), dtype=np.uint8)
+    if not ar:
         canvas[:, :, :3] = BG_COLOR
-        canvas[:, :,  3] = 255  # fully opaque background
+        canvas[:, :,  3] = 255
 
     nodes = graph.nodes
     edges = graph.edges
-
-    deg = _degree_map(graph)
+    deg   = _degree_map(graph)
     max_deg = max(deg.values()) if deg else 1
 
-    # Physics engine runs in a 1920×1080 coordinate space.
-    # Scale positions to whatever canvas size is requested so the graph
-    # fills the frame correctly at 128×128, 1280×720, 1920×1080, etc.
-    PHYS_W = 1920.0
-    PHYS_H = 1080.0
+    PHYS_W, PHYS_H = 1920.0, 1080.0
+    cx_frame  = width  / 2.0
+    cy_frame  = height / 2.0
+    max_dist  = (cx_frame ** 2 + cy_frame ** 2) ** 0.5
 
-    # Centre of frame — used for AR depth illusion
-    cx_frame = width  / 2.0
-    cy_frame = height / 2.0
-    max_dist = (cx_frame ** 2 + cy_frame ** 2) ** 0.5
-
+    # Build pixel positions + depth scale (centre = closer/brighter)
     pos: Dict[str, Tuple[int, int]] = {}
-    depth_scale: Dict[str, float] = {}
+    depth_s: Dict[str, float] = {}
     for node in nodes:
         px = int(np.clip(node.x / PHYS_W * width,  0, width  - 1))
         py = int(np.clip(node.y / PHYS_H * height, 0, height - 1))
         pos[node.id] = (px, py)
-        if ar:
-            # Nodes near the centre appear "closer" (larger); edge nodes appear
-            # further (smaller).  Scale range: 0.65 (corner) → 1.15 (centre).
-            dist = ((px - cx_frame) ** 2 + (py - cy_frame) ** 2) ** 0.5
-            t = dist / max_dist          # 0 = centre, 1 = corner
-            depth_scale[node.id] = 1.15 - t * 0.50
-        else:
-            depth_scale[node.id] = 1.0
+        dist = ((px - cx_frame) ** 2 + (py - cy_frame) ** 2) ** 0.5
+        t = dist / max(max_dist, 1.0)
+        # centre nodes 1.2×, corner nodes 0.6×
+        depth_s[node.id] = 1.20 - t * 0.60
 
-    # Helper: draw on BGRA canvas with full alpha on drawn pixels
-    def _line(p1, p2, color_bgr, alpha_val, thick=1):
-        # Draw on a scratch BGR image then stamp onto BGRA canvas
-        color_bgra = (*color_bgr, alpha_val)
-        cv2.line(canvas, p1, p2, color_bgra, thick, cv2.LINE_AA)
+    # -----------------------------------------------------------------------
+    # Neon confidence colour  (BGR, blended by confidence level)
+    # -----------------------------------------------------------------------
+    def _neon_color(confidence: float) -> Tuple[int, int, int]:
+        return _lerp_bgr(NODE_COLOR_LO, NODE_COLOR_HI, confidence)
 
-    def _circle(center, radius, color_bgr, alpha_val, filled):
-        color_bgra = (*color_bgr, alpha_val)
-        thickness = -1 if filled else 1
-        cv2.circle(canvas, center, radius, color_bgra, thickness, cv2.LINE_AA)
+    # -----------------------------------------------------------------------
+    # Draw neon-glowing circle (the key AR visual element)
+    # -----------------------------------------------------------------------
+    def _neon_circle(cx: int, cy: int, r: int, base: Tuple[int,int,int],
+                     ds: float, selected: bool) -> None:
+        """Multi-layer neon glow ring. Outer haze → bright ring → hot core."""
+        # Outer haze layers (big, dim, semi-transparent)
+        haze_layers = [
+            (r + int(18*ds), NEON_FAR_GLOW,  25),
+            (r + int(12*ds), NEON_FAR_GLOW,  45),
+            (r + int( 7*ds), NEON_MID_GLOW,  80),
+            (r + int( 4*ds), NEON_MID_GLOW, 120),
+        ]
+        for hr, hc, ha in haze_layers:
+            if hr > 0:
+                cv2.circle(canvas, (cx, cy), hr,
+                           (*hc, ha), 2, cv2.LINE_AA)
 
-    def _text(txt, org, color_bgr, alpha_val, scale, thick):
-        color_bgra = (*color_bgr, alpha_val)
-        cv2.putText(canvas, txt, org, FONT, scale, color_bgra, thick, cv2.LINE_AA)
+        # Semi-transparent dark fill (gives depth to the circle interior)
+        fill_a = int(55 * ds)
+        fill_c = (base[0]//6, base[1]//6, base[2]//8)
+        cv2.circle(canvas, (cx, cy), r, (*fill_c, fill_a), -1, cv2.LINE_AA)
 
-    # --- Edges ---
+        # Main neon ring (1-2 px bright)
+        ring_a = int(220 * ds)
+        cv2.circle(canvas, (cx, cy), r, (*NEON_RING, ring_a), 2, cv2.LINE_AA)
+
+        # Inner highlight arc (makes it look rounded / 3-D)
+        if r > 5:
+            hi_r = max(1, r - 2)
+            hi_a = int(100 * ds)
+            cv2.circle(canvas, (cx, cy), hi_r,
+                       (*NEON_HIGHLIGHT, hi_a), 1, cv2.LINE_AA)
+
+        # Hot white core dot
+        core_r = max(2, r // 4)
+        core_a = int(200 * ds)
+        cv2.circle(canvas, (cx, cy), core_r,
+                   (*NEON_CORE, core_a), -1, cv2.LINE_AA)
+
+        # Selection: expanding pulse rings
+        if selected:
+            for i, pr in enumerate(range(r + 6, r + 24, 5)):
+                pa = max(0, int(200 - i * 55))
+                cv2.circle(canvas, (cx, cy), pr,
+                           (*SEL_RING_COLOR, pa), 1, cv2.LINE_AA)
+
+    # -----------------------------------------------------------------------
+    # EDGES — thin neon lines with soft outer glow
+    # -----------------------------------------------------------------------
     for edge in edges:
         p1 = pos.get(edge.source_id)
         p2 = pos.get(edge.target_id)
         if p1 is None or p2 is None:
             continue
-        alpha_f = max(EDGE_ALPHA_MIN, edge.confidence * 0.5)
-        ec = tuple(int(c * alpha_f) for c in EDGE_COLOR)
-        edge_alpha = int(180 * alpha_f) if ar else 255
-        _line(p1, p2, ec, edge_alpha)
+        af = max(EDGE_ALPHA_MIN, edge.confidence * 0.5)
+        # Glow pass (thick, dim)
+        ga = int(40 * af)
+        cv2.line(canvas, p1, p2, (*EDGE_GLOW, ga), 3, cv2.LINE_AA)
+        # Core line (thin, bright)
+        la = int(160 * af)
+        cv2.line(canvas, p1, p2, (*EDGE_NEON, la), 1, cv2.LINE_AA)
 
-    # --- Nodes ---
+    # -----------------------------------------------------------------------
+    # NODES — neon glowing circles
+    # -----------------------------------------------------------------------
     for node in nodes:
         p = pos.get(node.id)
         if p is None:
             continue
         cx, cy = p
-        ds = depth_scale.get(node.id, 1.0)
-        r = max(2, int(_node_radius(deg.get(node.id, 0), max_deg) * ds))
-        color = _conf_color(node.confidence)
+        ds  = depth_s.get(node.id, 1.0)
+        r   = max(4, int(_node_radius(deg.get(node.id, 0), max_deg) * ds))
+        col = _neon_color(node.confidence)
         is_sel = (node.id == selected_id) or node.selected
-        node_alpha = 255
 
-        # Filled circle
-        _circle((cx, cy), r, color, node_alpha, filled=True)
+        _neon_circle(cx, cy, r, col, ds, is_sel)
 
-        # Selection ring
-        if is_sel:
-            _circle((cx, cy), r + 3, SEL_RING_COLOR, node_alpha, filled=False)
+        # HUD corner brackets
+        _draw_brackets_bgra(
+            canvas, cx, cy, r,
+            BRACKET_SEL_COLOR if is_sel else BRACKET_COLOR,
+            alpha=int((200 if is_sel else 140) * ds),
+        )
 
-        # Corner brackets
-        _draw_brackets_bgra(canvas, cx, cy, r,
-                             BRACKET_SEL_COLOR if is_sel else BRACKET_COLOR,
-                             alpha=200 if ar else 255)
-
-        # Label — drawn to the RIGHT of the dot, vertically centred
+        # Label — right of node, depth-scaled font
         if show_labels and node.label:
-            raw = node.label
-            label = raw[:18] + "..." if len(raw) > 18 else raw
-            font_scale = max(0.6, FONT_SCALE * ds)
-            (tw, th), _ = cv2.getTextSize(label, FONT, font_scale, FONT_THICK)
-            lx = cx + r + 8
+            raw   = node.label
+            label = (raw[:16] + "...") if len(raw) > 16 else raw
+            fs    = max(0.55, FONT_SCALE * ds)
+            (tw, th), _ = cv2.getTextSize(label, FONT, fs, FONT_THICK)
+            lx = cx + r + 7
             ly = cy + th // 2
-            # Shadow
-            _text(label, (lx + 1, ly + 1), LABEL_SHADOW,
-                  150 if ar else 255, font_scale, FONT_THICK + 1)
-            # Text
-            label_alpha = 230 if ar else 255
-            _text(label, (lx, ly), LABEL_COLOR,
-                  label_alpha, font_scale, FONT_THICK)
+            # Glow pass
+            la_glow = int(80 * ds)
+            cv2.putText(canvas, label, (lx + 1, ly + 1),
+                        FONT, fs, (*LABEL_GLOW, la_glow),
+                        FONT_THICK + 2, cv2.LINE_AA)
+            # Bright text
+            la_txt = int(230 * ds)
+            cv2.putText(canvas, label, (lx, ly),
+                        FONT, fs, (*LABEL_COLOR, la_txt),
+                        FONT_THICK, cv2.LINE_AA)
 
     return canvas
 
