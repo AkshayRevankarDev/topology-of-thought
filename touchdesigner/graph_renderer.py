@@ -199,10 +199,16 @@ def render_frame(
     deg = _degree_map(graph)
     max_deg = max(deg.values()) if deg else 1
 
+    # Physics engine runs in a 1920×1080 coordinate space.
+    # Scale positions to whatever canvas size is requested so the graph
+    # fills the frame correctly at 128×128, 1280×720, 1920×1080, etc.
+    PHYS_W = 1920.0
+    PHYS_H = 1080.0
+
     pos: Dict[str, Tuple[int, int]] = {}
     for node in nodes:
-        px = int(np.clip(node.x, 0, width - 1))
-        py = int(np.clip(node.y, 0, height - 1))
+        px = int(np.clip(node.x / PHYS_W * width,  0, width  - 1))
+        py = int(np.clip(node.y / PHYS_H * height, 0, height - 1))
         pos[node.id] = (px, py)
 
     # --- Edges ---
@@ -280,6 +286,9 @@ def render_to_rgba(
     """
     bgr = render_frame(graph, width=width, height=height, **kwargs)
     rgba_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
+    # TD Script TOP expects row 0 at the BOTTOM (OpenGL convention).
+    # OpenCV/NumPy have row 0 at the TOP, so flip vertically.
+    rgba_u8 = np.flipud(rgba_u8)
     return (rgba_u8 / 255.0).astype(np.float32)
 
 

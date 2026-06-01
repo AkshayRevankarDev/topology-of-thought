@@ -25,7 +25,19 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+try:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+except NameError:
+    # exec()'d without __file__ — search upward from project.folder / cwd
+    _found = None
+    for _start in ([Path(project.folder)] if 'project' in dir() else []) + [Path.cwd()]:  # type: ignore[name-defined]
+        for _d in [_start] + list(_start.parents):
+            if (_d / 'td_setup.py').exists() and (_d / 'touchdesigner').is_dir():
+                _found = _d
+                break
+        if _found:
+            break
+    PROJECT_ROOT = _found or Path.cwd()
 SESSION_PATH = PROJECT_ROOT / 'data' / 'sessions' / 'attention_is_all_you_need.json'
 TOE_SAVE_PATH = PROJECT_ROOT / 'touchdesigner' / 'topology_of_thought.toe'
 
@@ -199,7 +211,7 @@ hand_script_dat.text = _hand_script_code
 hand_chop = _make(scriptCHOP, 'hand_tracker', x=-200, y=400)
 # 'cooktype' does not exist in TD 2025 — Script CHOP always cooks when active.
 # Link Script CHOP to its script DAT (try all known parameter name variants).
-_set_par(hand_chop, 'dat', hand_script_dat, 'scriptdat', 'Dat', 'scriptDAT')
+_set_par(hand_chop, 'callbacks', hand_script_dat, 'dat', 'scriptdat', 'Dat', 'scriptDAT')
 
 print('[td_auto_setup] hand_tracker Script CHOP created')
 
@@ -214,34 +226,63 @@ _set_par(cam_top, 'resy',    480, 'resolutionh', 'height')
 print('[td_auto_setup] webcam_in TOP created')
 
 # ---------------------------------------------------------------------------
-# 6. Graph renderer script DAT + Script TOP
+# 6. Graph renderer script DAT + noise_trigger TOP + Script TOP
 # ---------------------------------------------------------------------------
-_render_script_code = f'''# Graph renderer cook function — referenced by graph_render Script TOP
-import sys as _sys
+# Load the callbacks content from the live file so this setup always stays
+# in sync with edits made outside TD.
+_render_script_live = PROJECT_ROOT / 'touchdesigner' / 'render_script_live.py'
+if _render_script_live.exists():
+    _render_script_code = _render_script_live.read_text(encoding='utf-8')
+    print(f'[td_auto_setup] Loaded render_script from {_render_script_live.name}')
+else:
+    # Fallback inline version if the file is missing
+    _render_script_code = f'''import sys as _sys
 _root = r'{PROJECT_ROOT}'
 _venv = r'{VENV_SITE}'
 for _p in (_root, _venv):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
+_sys.modules.pop('touchdesigner.graph_renderer', None)
 
 def cook(scriptOp):
-    """Render the knowledge graph to this TOP each frame."""
-    graph = op('/project1').fetch('graph', None)
-    if graph is None:
+    g = op('/project1').fetch('graph', None)
+    if g is None:
+        import numpy as np
+        scriptOp.copyNumpyArray(
+            np.zeros((scriptOp.height, scriptOp.width, 4), dtype=np.float32))
         return
-    scriptOp.storage['graph'] = graph
-    from touchdesigner.graph_renderer import cook as _rcook
-    _rcook(scriptOp)
+    try:
+        import numpy as np
+        from touchdesigner.graph_renderer import render_to_rgba
+        out_w = max(scriptOp.width, 1280)
+        out_h = max(scriptOp.height, 720)
+        rgba = render_to_rgba(g, width=out_w, height=out_h)
+        scriptOp.copyNumpyArray(np.ascontiguousarray(rgba, dtype=np.float32))
+    except Exception as e:
+        print(f'[render] ERROR: {{e}}')
+        import traceback; traceback.print_exc()
 '''
+    print('[td_auto_setup] WARNING: render_script_live.py not found, using inline fallback')
 
 render_script_dat = _make(textDAT, 'render_script', x=-200, y=0)
 render_script_dat.text = _render_script_code
 
-render_top = _make(scriptTOP, 'graph_render', x=0, y=0)
-_set_par(render_top, 'resolutionw', 1920, 'resx', 'width')
-_set_par(render_top, 'resolutionh', 1080, 'resy', 'height')
-_set_par(render_top, 'pixelformat', 'rgba32float', 'format', 'Pixelformat')
-_set_par(render_top, 'dat', render_script_dat, 'scriptdat', 'Dat')
+# noise_trigger: a time-varying Noise TOP whose output drives graph_render
+# to cook every frame, without creating a dependency loop.
+noise_trigger = _make(noiseTOP, 'noise_trigger', x=-50, y=0)
+_set_par(noise_trigger, 'resolutionw', 1280, 'resx', 'width')
+_set_par(noise_trigger, 'resolutionh', 720,  'resy', 'height')
+
+render_top = _make(scriptTOP, 'graph_render', x=100, y=0)
+_set_par(render_top, 'callbacks', render_script_dat, 'dat', 'scriptdat', 'Dat')
+
+# Wire noise_trigger into graph_render input 0 so every noise frame
+# causes graph_render to re-cook and update its output.
+try:
+    render_top.inputConnectors[0].connect(noise_trigger)
+    print('[td_auto_setup] noise_trigger → graph_render connected')
+except Exception as _e:
+    print(f'[td_auto_setup] WARNING noise_trigger connect: {_e}')
 
 print('[td_auto_setup] graph_render Script TOP created')
 
@@ -343,7 +384,7 @@ def _try_import():
         print(f'[gesture_exec] WARNING: could not import gesture/hand modules: {{_e}}')
         print('[gesture_exec] Hand gestures disabled until TD Python Module Path is set.')
         print('[gesture_exec] Edit → Preferences → DATs → Python 64-bit Module Path:')
-        print(f'[gesture_exec]   {_venv}')
+        print(f'[gesture_exec]   {{_venv}}')
         print('[gesture_exec] Then restart TD.')
     return _import_ok
 
@@ -439,7 +480,8 @@ _positions = {
     'hand_track_script':(-400,  400),
     'hand_tracker':     (-200,  400),
     'render_script':    (-200,  200),
-    'graph_render':     (   0,  200),
+    'noise_trigger':    (  50,  200),
+    'graph_render':     ( 200,  200),
     'physics_exec':     (-400, -200),
     'gesture_exec':     (-200, -200),
     'composite':        ( 200,  200),

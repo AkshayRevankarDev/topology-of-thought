@@ -21,21 +21,58 @@ Prerequisites:
 
 from pathlib import Path
 
-# Locate the touchdesigner/td_auto_setup.py script next to this file.
-_HERE = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()
-_AUTO_SETUP = _HERE / 'touchdesigner' / 'td_auto_setup.py'
+# ---------------------------------------------------------------------------
+# Locate td_auto_setup.py — must work both as a plain script AND when
+# exec(open(...).read())'d from inside the TD Textport (where __file__ is
+# NOT defined and project.folder points at the *open .toe*, not this repo).
+# ---------------------------------------------------------------------------
 
-if not _AUTO_SETUP.exists():
-    # When run inside TD's Textport, __file__ may not be defined; fall back
-    # to the saved project folder.
+def _find_auto_setup() -> Path:
+    candidates = []
+
+    # 1. Ideal: __file__ is defined (running as a real module / script).
+    if '__file__' in globals():
+        candidates.append(Path(__file__).resolve().parent / 'touchdesigner' / 'td_auto_setup.py')
+
+    # 2. project.folder — the directory of the currently-open .toe file.
+    #    Only useful when that .toe lives inside the project tree.
     try:
-        _AUTO_SETUP = Path(project.folder) / 'touchdesigner' / 'td_auto_setup.py'  # type: ignore[name-defined]
+        candidates.append(Path(project.folder) / 'touchdesigner' / 'td_auto_setup.py')  # type: ignore[name-defined]
     except Exception:
         pass
 
-if not _AUTO_SETUP.exists():
+    # 3. Walk *up* from project.folder looking for the repo root
+    #    (identified by td_setup.py + touchdesigner/ co-existing).
+    try:
+        _pf = Path(project.folder)  # type: ignore[name-defined]
+        for _d in [_pf] + list(_pf.parents):
+            _test = _d / 'touchdesigner' / 'td_auto_setup.py'
+            if _test.exists() and (_d / 'td_setup.py').exists():
+                candidates.append(_test)
+                break
+    except Exception:
+        pass
+
+    # 4. Walk up from cwd (works when run from a terminal inside the repo).
+    for _d in [Path.cwd()] + list(Path.cwd().parents):
+        _test = _d / 'touchdesigner' / 'td_auto_setup.py'
+        if _test.exists() and (_d / 'td_setup.py').exists():
+            candidates.append(_test)
+            break
+
+    for c in candidates:
+        if c.exists():
+            return c
+
     raise FileNotFoundError(
-        f"Could not locate td_auto_setup.py.  Expected at: {_AUTO_SETUP}"
+        "Could not locate td_auto_setup.py.\n"
+        "Tried:\n" + "\n".join(f"  {c}" for c in candidates) + "\n\n"
+        "Make sure you run this from inside the topology_of_thought repo,\n"
+        "or open a .toe that is saved inside the repo directory."
     )
 
-exec(compile(_AUTO_SETUP.read_text(), str(_AUTO_SETUP), 'exec'))
+
+_AUTO_SETUP = _find_auto_setup()
+# Pass __file__ explicitly so td_auto_setup.py can compute PROJECT_ROOT correctly.
+exec(compile(_AUTO_SETUP.read_text(), str(_AUTO_SETUP), 'exec'),
+     {**globals(), '__file__': str(_AUTO_SETUP)})
