@@ -43,10 +43,20 @@ def onSetupParameters(scriptOp):
     return
 
 
+def _get_graph():
+    store = op('/project1/graph_store')
+    if store is None:
+        return None
+    try:
+        return mod(store).graph
+    except Exception:
+        return None
+
+
 def onCook(scriptOp):
     scriptOp.clear()
 
-    graph = op('/project1').fetch('graph', None)
+    graph = _get_graph()
     chan_names = ('p1x', 'p1y', 'p1z', 'p2x', 'p2y', 'p2z', 'weight', 'confidence')
 
     if graph is None or not graph.edges or not graph.nodes:

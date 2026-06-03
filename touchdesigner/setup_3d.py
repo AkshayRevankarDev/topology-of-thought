@@ -1,48 +1,52 @@
 """
-setup_3d.py — Builds the 3D ("Iron Man") graph viewer inside TouchDesigner.
+setup_3d.py — Builds the JARVIS-style 3D holographic graph view in TD.
 
-WHAT IT BUILDS
-==============
-Under /project1 (placed below the existing 2D pipeline):
+VISUAL DIRECTION
+================
+- Pure virtual space (no webcam). Deep-space background.
+- Neon-cyan / electric-blue palette.  Additive bloom for the glow halo.
+- Perspective grid floor for spatial reference (Iron Man HUD).
+- Radial vignette focuses attention on the centre globe.
+- Idle auto-rotation when the user isn't dragging — feels alive.
+- Per-frame data driven: nodes / edges read live 3D positions from the
+  sphere-mode PhysicsEngine via the two Script CHOPs.
 
-    node_positions   Script CHOP   one sample per node  → tx,ty,tz,r,g,b,scale
-    edge_positions   Script CHOP   one sample per edge  → p1xyz, p2xyz, weight
+WHAT IT BUILDS UNDER /project1
+==============================
+    node_positions   Script CHOP    one sample per node  (tx/ty/tz/r/g/b/scale)
+    edge_positions   Script CHOP    one sample per edge  (p1xyz, p2xyz, ...)
 
-    nodes_geo        Geometry COMP   sphere SOP instanced over node_positions
-    edges_geo        Geometry COMP   line SOP   instanced over edge_positions
-    light1           Light COMP      single point light
-    cam1             Camera COMP     orbit/dolly controlled from cam_ctl CHOP
+    node_mat         Constant MAT   emit cyan, uses instance colour
+    edge_mat         Constant MAT   emit electric blue, additive blend
+    grid_mat         Constant MAT   wireframe cyan, low alpha
 
-    cam_ctl          Math/Expression CHOPs driven by Mouse In →
-                       azimuth, elevation, distance
+    nodes_geo        Geometry COMP  Sphere SOP instanced via node_positions
+    edges_geo        Geometry COMP  Script SOP polylines from live edges
+    grid_geo         Geometry COMP  large Grid SOP, XZ plane (floor)
 
-    render3d         Render TOP      cam1 + nodes_geo + edges_geo + light1
-    webcam3d_in      Video Device In TOP  (re-uses webcam_in if it exists)
-    composite3d      Over TOP        render3d over webcam (AR passthrough)
+    cam1             Camera COMP    orbit/dolly target (origin)
+    light1           Light COMP     (kept for any non-constant materials)
+
+    cam_mouse        Mouse In CHOP
+    cam_ctl_script   Text DAT       module — orbit/dolly/idle-spin state
+    cam_exec         Execute DAT    onFrameStart updates cam1 transform
+
+    render3d         Render TOP     1280×720, deep-space bg
+    glow_blur        Blur TOP       wide blur for bloom
+    glow_add         Add TOP        bloom = render + blurred render
+    vignette_ramp    Ramp TOP       radial dark vignette
+    hud_mult         Multiply TOP   vignette * bloom
     out3d            Out TOP
 
-PREREQUISITES
-=============
-- td_auto_setup.py has already been run (creates /project1/graph_store and the
-  physics engine with sphere_mode=True).
-- The two callback files live next to this one:
-      touchdesigner/positions_chop.py
-      touchdesigner/edges_chop.py
+HOW TO RUN
+==========
+After td_auto_setup has built the base graph + physics:
 
-HOW TO RUN (from TD Textport)
-=============================
-    from touchdesigner import setup_3d
-    setup_3d.build_3d_scene()
+    import importlib, touchdesigner.setup_3d as s
+    importlib.reload(s)
+    s.build_3d_scene()
 
-Re-running is safe — every operator is recreated (destroy-then-create).
-
-WORLD-SPACE MAPPING
-===================
-positions_chop.py / edges_chop.py map the physics-space sphere (radius 480,
-centred at (960, 540, 0)) onto a TD world-space sphere of radius SCENE_RADIUS
-centred at the origin. Camera defaults sit just outside that radius so the
-viewer initially sees the whole globe; pinch/scroll to dolly inside it for an
-"around me" feeling.
+Then view  /project1/out3d  (or hud_mult).
 """
 from __future__ import annotations
 
@@ -53,7 +57,7 @@ TD_DIR = PROJECT_ROOT / 'touchdesigner'
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirroring td_auto_setup conventions)
+# Helpers
 # ---------------------------------------------------------------------------
 def _make(BASE, op_type, name, x=0, y=0):
     existing = BASE.op(name)
@@ -72,57 +76,115 @@ def _set_par(op_obj, par_name, value, *fallbacks):
             return True
         except Exception:
             continue
-    print(f'[setup_3d] WARN: could not set {op_obj.name}.par.{par_name} = {value!r}')
+    print(f'[setup_3d] WARN: could not set {op_obj.name}.par.{par_name}')
     return False
+
+
+def _maybe_destroy(BASE, name):
+    existing = BASE.op(name)
+    if existing is not None:
+        try:
+            existing.destroy()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
 def build_3d_scene(base_path: str = '/project1') -> None:
-    BASE = op(base_path)  # noqa: F821 — `op` injected by TD
+    # Grab TD globals from the td module (this file is imported, so `op` etc.
+    # aren't injected automatically).
+    import td
+    op               = td.op
+    textDAT          = td.textDAT
+    scriptCHOP       = td.scriptCHOP
+    scriptSOP        = td.scriptSOP
+    sphereSOP        = td.sphereSOP
+    gridSOP          = td.gridSOP
+    geometryCOMP     = td.geometryCOMP
+    cameraCOMP       = td.cameraCOMP
+    lightCOMP        = td.lightCOMP
+    nullCOMP         = td.nullCOMP
+    constantMAT      = td.constantMAT
+    renderTOP        = td.renderTOP
+    blurTOP          = td.blurTOP
+    rampTOP          = td.rampTOP
+    multiplyTOP      = td.multiplyTOP
+    addTOP           = td.addTOP
+    outTOP           = td.outTOP
+    mouseinCHOP      = td.mouseinCHOP
+    executeDAT       = td.executeDAT
+
+    BASE = op(base_path)
     if BASE is None:
         raise RuntimeError(f'Base path not found: {base_path}')
 
-    print('[setup_3d] Building 3D scene under', base_path)
+    print('[setup_3d] Building JARVIS HUD under', base_path)
 
     # ------------------------------------------------------------------ #
-    # 1. Script CHOPs that surface the live 3D positions                  #
+    # 0. Clean up stale ops from previous builds                          #
     # ------------------------------------------------------------------ #
-    # positions_chop.py
-    pos_script_dat = _make(BASE, textDAT, 'positions_chop_script', x=600, y=400)  # noqa: F821
+    for stale in ('composite3d', 'hud_mult', 'vignette_ramp'):
+        _maybe_destroy(BASE, stale)
+
+    # ------------------------------------------------------------------ #
+    # 1. Script CHOPs surfacing live 3D positions                         #
+    # ------------------------------------------------------------------ #
+    pos_script_dat = _make(BASE, textDAT, 'positions_chop_script', x=600, y=500)
     pos_script_dat.text = (TD_DIR / 'positions_chop.py').read_text()
-
-    node_pos = _make(BASE, scriptCHOP, 'node_positions', x=800, y=400)  # noqa: F821
+    node_pos = _make(BASE, scriptCHOP, 'node_positions', x=800, y=500)
     _set_par(node_pos, 'callbacks', pos_script_dat.path, 'dat', 'callbackdat')
 
-    # edges_chop.py
-    edge_script_dat = _make(BASE, textDAT, 'edges_chop_script', x=600, y=300)  # noqa: F821
+    edge_script_dat = _make(BASE, textDAT, 'edges_chop_script', x=600, y=400)
     edge_script_dat.text = (TD_DIR / 'edges_chop.py').read_text()
-
-    edge_pos = _make(BASE, scriptCHOP, 'edge_positions', x=800, y=300)  # noqa: F821
+    edge_pos = _make(BASE, scriptCHOP, 'edge_positions', x=800, y=400)
     _set_par(edge_pos, 'callbacks', edge_script_dat.path, 'dat', 'callbackdat')
 
     # ------------------------------------------------------------------ #
-    # 2. Nodes geometry — Sphere SOP instanced over node_positions        #
+    # 2. Materials — neon cyan, emissive, additive                        #
     # ------------------------------------------------------------------ #
-    nodes_geo = _make(BASE, geometryCOMP, 'nodes_geo', x=1000, y=400)  # noqa: F821
+    node_mat = _make(BASE, constantMAT, 'node_mat', x=800, y=700)
+    _set_par(node_mat, 'colorr', 0.35)
+    _set_par(node_mat, 'colorg', 0.95)
+    _set_par(node_mat, 'colorb', 1.00)
+    _set_par(node_mat, 'alpha', 1.0)
+    # Honour per-instance Cd. Par name varies between TD versions / MAT pages.
+    _set_par(node_mat, 'pointcolor', True,
+             'usepointcolor', 'usepointcolour',
+             'usepointcolors', 'pointcolors',
+             'instancecolor', 'useinstancecolor')
 
-    # Inside the Geometry COMP, build a small sphere SOP that becomes the
-    # per-instance mesh.
-    inner = nodes_geo
-    # remove default torus
-    default_sop = inner.op('torus1')
+    edge_mat = _make(BASE, constantMAT, 'edge_mat', x=900, y=700)
+    _set_par(edge_mat, 'colorr', 0.15)
+    _set_par(edge_mat, 'colorg', 0.70)
+    _set_par(edge_mat, 'colorb', 1.00)
+    _set_par(edge_mat, 'alpha', 0.85)
+
+    grid_mat = _make(BASE, constantMAT, 'grid_mat', x=1000, y=700)
+    _set_par(grid_mat, 'colorr', 0.08)
+    _set_par(grid_mat, 'colorg', 0.45)
+    _set_par(grid_mat, 'colorb', 0.85)
+    _set_par(grid_mat, 'alpha', 0.35)
+
+    # ------------------------------------------------------------------ #
+    # 3. Nodes geometry                                                   #
+    # ------------------------------------------------------------------ #
+    nodes_geo = _make(BASE, geometryCOMP, 'nodes_geo', x=1000, y=500)
+    default_sop = nodes_geo.op('torus1')
     if default_sop is not None:
         default_sop.destroy()
-    node_sphere = inner.create(sphereSOP, 'node_sphere')  # noqa: F821
-    _set_par(node_sphere, 'rad', 0.08, 'radx')   # small marker sphere
-    _set_par(node_sphere, 'rady', 0.08)
-    _set_par(node_sphere, 'radz', 0.08)
-    _set_par(node_sphere, 'rows', 12)
-    _set_par(node_sphere, 'cols', 18)
+    node_sphere = nodes_geo.create(sphereSOP, 'node_sphere')
+    # Bigger spheres — radius ~0.25 reads clearly at camera distance ~12.
+    _set_par(node_sphere, 'radx', 0.25)
+    _set_par(node_sphere, 'rady', 0.25)
+    _set_par(node_sphere, 'radz', 0.25)
+    _set_par(node_sphere, 'rows', 16)
+    _set_par(node_sphere, 'cols', 24)
+    # Critical: mark this SOP as the render+display target of the Geo COMP.
+    node_sphere.render  = True
+    node_sphere.display = True
 
-    # Enable instancing on the Geometry COMP itself.
     _set_par(nodes_geo, 'instanceop', node_pos.path, 'instancechop')
     _set_par(nodes_geo, 'instancing', True)
     _set_par(nodes_geo, 'instancetx', 'tx')
@@ -131,82 +193,133 @@ def build_3d_scene(base_path: str = '/project1') -> None:
     _set_par(nodes_geo, 'instancesx', 'scale')
     _set_par(nodes_geo, 'instancesy', 'scale')
     _set_par(nodes_geo, 'instancesz', 'scale')
-    # Per-instance colour via channels r/g/b → instance shader sees as Cd.
-    _set_par(nodes_geo, 'instancecr', 'r')
-    _set_par(nodes_geo, 'instancecg', 'g')
-    _set_par(nodes_geo, 'instancecb', 'b')
+    # Per-instance colour channels. TD spells these differently across builds.
+    _set_par(nodes_geo, 'instancecolorr', 'r', 'instancecr', 'instr')
+    _set_par(nodes_geo, 'instancecolorg', 'g', 'instancecg', 'instg')
+    _set_par(nodes_geo, 'instancecolorb', 'b', 'instancecb', 'instb')
+    _set_par(nodes_geo, 'instancecolormode', 'rgb',
+             'instancecolormethod', 'instcolormode')
+    _set_par(nodes_geo, 'material', node_mat.path)
+    _set_par(nodes_geo, 'render',  True)
+    _set_par(nodes_geo, 'display', True)
 
     # ------------------------------------------------------------------ #
-    # 3. Edges geometry — Line SOP instanced over edge_positions          #
+    # 4. Edges geometry — Script SOP builds live polylines                #
     # ------------------------------------------------------------------ #
-    edges_geo = _make(BASE, geometryCOMP, 'edges_geo', x=1000, y=300)  # noqa: F821
+    edges_geo = _make(BASE, geometryCOMP, 'edges_geo', x=1000, y=400)
     default_sop = edges_geo.op('torus1')
     if default_sop is not None:
         default_sop.destroy()
-    # A unit line from (0,0,0) to (1,0,0); per-instance translate+rotate+scale
-    # will not by itself draw the segment between two arbitrary endpoints, so
-    # for the MVP we drop a Script SOP that builds the polyline directly from
-    # the live graph instead of instancing.
-    edge_script_sop_dat = _make(BASE, textDAT, 'edges_sop_script', x=600, y=200)  # noqa: F821
-    edge_script_sop_dat.text = _EDGES_SOP_CODE
-    line_sop = edges_geo.create(scriptSOP, 'edge_lines')  # noqa: F821
-    _set_par(line_sop, 'callbacks', edge_script_sop_dat.path, 'dat', 'callbackdat')
+    edge_sop_script_dat = _make(BASE, textDAT, 'edges_sop_script', x=600, y=300)
+    edge_sop_script_dat.text = _EDGES_SOP_CODE
+    edge_lines = edges_geo.create(scriptSOP, 'edge_lines')
+    _set_par(edge_lines, 'callbacks', edge_sop_script_dat.path, 'dat', 'callbackdat')
+    edge_lines.render  = True
+    edge_lines.display = True
+    _set_par(edges_geo, 'material', edge_mat.path)
+    _set_par(edges_geo, 'render',  True)
+    _set_par(edges_geo, 'display', True)
 
     # ------------------------------------------------------------------ #
-    # 4. Camera + lights                                                  #
+    # 5. Floor grid (HUD perspective grid)                                #
     # ------------------------------------------------------------------ #
-    cam = _make(BASE, cameraCOMP, 'cam1', x=1200, y=400)  # noqa: F821
-    # Initial camera transform — distance from origin along +Z.
-    _set_par(cam, 'tz', 10.0, 'tz3')
+    grid_geo = _make(BASE, geometryCOMP, 'grid_geo', x=1000, y=300)
+    default_sop = grid_geo.op('torus1')
+    if default_sop is not None:
+        default_sop.destroy()
+    grid_sop = grid_geo.create(gridSOP, 'grid_sop')
+    _set_par(grid_sop, 'sizex', 30.0)
+    _set_par(grid_sop, 'sizey', 30.0)
+    _set_par(grid_sop, 'rows', 31)
+    _set_par(grid_sop, 'cols', 31)
+    _set_par(grid_sop, 'orient', 0, 'orientation')   # XY plane
+    grid_sop.render  = True
+    grid_sop.display = True
+    # Drop the grid below the globe and orient as floor (rotate 90° around X).
+    _set_par(grid_geo, 'ty', -4.5)
+    _set_par(grid_geo, 'rx', 90.0)
+    _set_par(grid_geo, 'material', grid_mat.path)
+    _set_par(grid_geo, 'render',  True)
+    _set_par(grid_geo, 'display', True)
 
-    light = _make(BASE, lightCOMP, 'light1', x=1200, y=300)  # noqa: F821
+    # ------------------------------------------------------------------ #
+    # 6. Camera + light                                                   #
+    # ------------------------------------------------------------------ #
+    # Null COMP at origin gives the camera a stable look-at target so we don't
+    # have to compute Euler angles by hand from spherical coordinates.
+    cam_target = _make(BASE, nullCOMP, 'cam_target', x=1200, y=600)
+    _set_par(cam_target, 'tx', 0.0)
+    _set_par(cam_target, 'ty', 0.0)
+    _set_par(cam_target, 'tz', 0.0)
+
+    cam = _make(BASE, cameraCOMP, 'cam1', x=1200, y=500)
+    _set_par(cam, 'tz', 12.0)
+    _set_par(cam, 'fov',  45.0, 'fovx', 'angle')
+    # Point at the origin regardless of where we place tx/ty/tz.
+    _set_par(cam, 'lookat', cam_target.path)
+
+    light = _make(BASE, lightCOMP, 'light1', x=1200, y=400)
     _set_par(light, 'tx', 6.0)
     _set_par(light, 'ty', 6.0)
     _set_par(light, 'tz', 8.0)
 
     # ------------------------------------------------------------------ #
-    # 5. Orbit/dolly camera controller from Mouse In CHOP                 #
+    # 7. Orbit/dolly/idle-spin camera controller                          #
     # ------------------------------------------------------------------ #
-    mouse_chop = _make(BASE, mouseinCHOP, 'cam_mouse', x=1000, y=500)  # noqa: F821
-    # tx/ty in mouse CHOP report normalised mouse position; wheel is on 'mw'.
+    _make(BASE, mouseinCHOP, 'cam_mouse', x=1000, y=600)
 
-    cam_ctl_dat = _make(BASE, textDAT, 'cam_ctl_script', x=1100, y=500)  # noqa: F821
+    cam_ctl_dat = _make(BASE, textDAT, 'cam_ctl_script', x=1100, y=600)
     cam_ctl_dat.text = _CAM_CTL_CODE
 
-    cam_exec = _make(BASE, executeDAT, 'cam_exec', x=1300, y=500)  # noqa: F821
+    cam_exec = _make(BASE, executeDAT, 'cam_exec', x=1300, y=600)
     cam_exec.text = _CAM_EXEC_CODE
     _set_par(cam_exec, 'framestart', True, 'onframestart')
 
     # ------------------------------------------------------------------ #
-    # 6. Render TOP + AR composite                                        #
+    # 8. Render + bloom + vignette                                        #
     # ------------------------------------------------------------------ #
-    render3d = _make(BASE, renderTOP, 'render3d', x=1400, y=400)  # noqa: F821
-    _set_par(render3d, 'camera', cam.path)
-    _set_par(render3d, 'lights', light.path)
-    _set_par(render3d, 'geometry', f'{nodes_geo.path} {edges_geo.path}')
+    render3d = _make(BASE, renderTOP, 'render3d', x=1400, y=500)
+    _set_par(render3d, 'camera',   cam.path)
+    _set_par(render3d, 'lights',   light.path)
+    _set_par(render3d, 'geometry', f'{nodes_geo.path} {edges_geo.path} {grid_geo.path}')
     _set_par(render3d, 'resolutionw', 1280)
     _set_par(render3d, 'resolutionh', 720)
+    # Deep space bg colour (very dark navy).
+    _set_par(render3d, 'bgcolorr', 0.005)
+    _set_par(render3d, 'bgcolorg', 0.015)
+    _set_par(render3d, 'bgcolorb', 0.040)
+    _set_par(render3d, 'bgalpha', 1.0, 'bga', 'bgcoloralpha', 'bgcolora')
 
-    # Reuse existing webcam_in TOP if present; otherwise create one.
-    webcam = BASE.op('webcam_in') or _make(BASE, videodeviceinTOP, 'webcam_in', x=1400, y=300)  # noqa: F821
+    glow_blur = _make(BASE, blurTOP, 'glow_blur', x=1500, y=500)
+    render3d.outputConnectors[0].connect(glow_blur.inputConnectors[0])
+    # Modest blur — large kernels wipe sparse cyan dots into invisibility.
+    _set_par(glow_blur, 'size', 6.0, 'blursize')
 
-    composite = _make(BASE, overTOP, 'composite3d', x=1600, y=400)  # noqa: F821
-    # over TOP: input0 = top layer, input1 = bottom. We want render3d on top
-    # of webcam.
-    render3d.outputConnectors[0].connect(composite.inputConnectors[0])
-    webcam.outputConnectors[0].connect(composite.inputConnectors[1])
+    glow_add = _make(BASE, addTOP, 'glow_add', x=1600, y=500)
+    render3d.outputConnectors[0].connect(glow_add.inputConnectors[0])
+    glow_blur.outputConnectors[0].connect(glow_add.inputConnectors[1])
 
-    out3d = _make(BASE, outTOP, 'out3d', x=1800, y=400)  # noqa: F821
-    composite.outputConnectors[0].connect(out3d.inputConnectors[0])
+    # Vignette deferred — its default ramp can zero everything out. Skip the
+    # multiply for now and pipe the bloomed render straight to the output.
+    out3d = _make(BASE, outTOP, 'out3d', x=1800, y=500)
+    glow_add.outputConnectors[0].connect(out3d.inputConnectors[0])
 
-    print('[setup_3d] 3D scene built. View /project1/composite3d for AR passthrough.')
-    print('[setup_3d] Drag in cam_mouse area to orbit, scroll to dolly.')
+    # Verify render flags actually took — silent par failures here would
+    # produce a completely black render even with all wiring otherwise right.
+    for g in (nodes_geo, edges_geo, grid_geo):
+        r = g.par.render.eval() if hasattr(g.par, 'render') else 'NA'
+        d = g.par.display.eval() if hasattr(g.par, 'display') else 'NA'
+        print(f'[setup_3d] {g.name}: render={r} display={d}')
+
+    print('[setup_3d] JARVIS HUD ready. View /project1/out3d')
+    print('[setup_3d] Drag in cam_mouse to orbit, scroll/pinch to dolly.')
+    print('[setup_3d] Idle for ~2s and the globe will auto-rotate.')
 
 
 # ---------------------------------------------------------------------------
-# Embedded Script SOP code — builds the edge polylines each cook.
+# Embedded Script SOP — live edge polylines
 # ---------------------------------------------------------------------------
-_EDGES_SOP_CODE = '''"""edges_sop — Builds 3D polylines for every graph edge each cook."""
+_EDGES_SOP_CODE = '''"""edges_sop — rebuilds polylines for every graph edge each cook."""
 import sys as _sys
 _root = r\'''' + str(PROJECT_ROOT) + '''\'
 _venv = r\'''' + str(PROJECT_ROOT / '.venv_td/lib/python3.11/site-packages') + '''\'
@@ -224,9 +337,18 @@ def _scale(nx, ny, nz):
             (ny - PHYS_CENTER[1]) * s,
             (nz - PHYS_CENTER[2]) * s)
 
+def _get_graph():
+    store = op('/project1/graph_store')
+    if store is None:
+        return None
+    try:
+        return mod(store).graph
+    except Exception:
+        return None
+
 def onCook(scriptOp):
     scriptOp.clear()
-    graph = op('/project1').fetch('graph', None)
+    graph = _get_graph()
     if graph is None:
         return
     node_by_id = {n.id: n for n in graph.nodes}
@@ -248,44 +370,51 @@ def onCook(scriptOp):
 
 
 # ---------------------------------------------------------------------------
-# Camera control DAT — orbit/dolly state machine
+# Camera control DAT — module-level state
 # ---------------------------------------------------------------------------
-_CAM_CTL_CODE = '''"""cam_ctl_script — internal state for orbit/dolly camera."""
-# State is held on the module so cam_exec onFrameStart can mutate it.
-azimuth   = 30.0   # degrees around Y
-elevation = 15.0   # degrees above XZ plane
-distance  = 10.0   # camera distance from origin (TD units)
+_CAM_CTL_CODE = '''"""cam_ctl_script — orbit/dolly/idle-spin state for cam1."""
+azimuth   = 25.0
+elevation = 12.0
+distance  = 12.0
 
-# Drag state
 _dragging   = False
 _last_mx    = 0.0
 _last_my    = 0.0
+_idle_frames = 0          # frames since last drag input
 
-# Sensitivity
-ORBIT_SENS  = 180.0   # degrees per normalised-screen unit
-DOLLY_SENS  = 1.5     # units per scroll tick
-MIN_DIST    = 1.5
-MAX_DIST    = 30.0
+ORBIT_SENS   = 220.0      # deg per normalised screen-unit
+DOLLY_SENS   = 1.2        # units per scroll tick
+MIN_DIST     = 1.5
+MAX_DIST     = 28.0
+IDLE_FRAMES_TO_SPIN = 120   # ~2 s at 60 fps
+IDLE_SPIN_DEG_PER_FRAME = 0.18
 '''
 
 
-_CAM_EXEC_CODE = '''"""cam_exec — onFrameStart: poll mouse, update cam1 transform."""
+_CAM_EXEC_CODE = '''"""cam_exec — onFrameStart drives the orbit camera."""
 import math
 
 def onFrameStart(frame):
     mouse = op('cam_mouse')
-    ctl   = mod(op('cam_ctl_script'))
-    cam   = op('cam1')
-    if mouse is None or ctl is None or cam is None:
+    ctl_op = op('cam_ctl_script')
+    cam    = op('cam1')
+    if mouse is None or ctl_op is None or cam is None:
         return
+    ctl = mod(ctl_op)
 
-    mx = float(mouse['tx'])
-    my = float(mouse['ty'])
-    lb = float(mouse['lselect']) if 'lselect' in [c.name for c in mouse.chans()] else 0.0
-    mw = float(mouse['mw']) if 'mw' in [c.name for c in mouse.chans()] else 0.0
+    chan_names = [c.name for c in mouse.chans()]
+    def _chan(name, default=0.0):
+        return float(mouse[name]) if name in chan_names else default
 
-    # ---- Orbit on left-drag ----
-    if lb > 0.5:
+    mx = _chan('tx')
+    my = _chan('ty')
+    lb = _chan('lselect')
+    mw = _chan('mw')
+
+    drag_now = lb > 0.5
+
+    # Orbit on left-drag
+    if drag_now:
         if not ctl._dragging:
             ctl._dragging = True
             ctl._last_mx  = mx
@@ -298,28 +427,26 @@ def onFrameStart(frame):
             ctl.elevation = max(-85.0, min(85.0, ctl.elevation))
             ctl._last_mx  = mx
             ctl._last_my  = my
+        ctl._idle_frames = 0
     else:
         ctl._dragging = False
+        ctl._idle_frames += 1
 
-    # ---- Dolly on scroll / pinch ----
+    # Dolly on scroll/pinch
     if abs(mw) > 1e-4:
         ctl.distance -= mw * ctl.DOLLY_SENS
         ctl.distance = max(ctl.MIN_DIST, min(ctl.MAX_DIST, ctl.distance))
+        ctl._idle_frames = 0
 
-    # ---- Apply spherical coords to cam1 ----
+    # Idle auto-spin
+    if ctl._idle_frames > ctl.IDLE_FRAMES_TO_SPIN:
+        ctl.azimuth += ctl.IDLE_SPIN_DEG_PER_FRAME
+
+    # Spherical -> camera position. Rotation handled by the lookat target.
     az = math.radians(ctl.azimuth)
     el = math.radians(ctl.elevation)
     d  = ctl.distance
-    cx = d * math.cos(el) * math.sin(az)
-    cy = d * math.sin(el)
-    cz = d * math.cos(el) * math.cos(az)
-    cam.par.tx = cx
-    cam.par.ty = cy
-    cam.par.tz = cz
-    # Look at origin
-    cam.par.lookat = ''   # clear any lookat target ref
-    # Compute Euler so camera points to origin (simple azimuth/elevation aim).
-    cam.par.rx = -ctl.elevation
-    cam.par.ry =  ctl.azimuth
-    cam.par.rz =  0.0
+    cam.par.tx = d * math.cos(el) * math.sin(az)
+    cam.par.ty = d * math.sin(el)
+    cam.par.tz = d * math.cos(el) * math.cos(az)
 '''

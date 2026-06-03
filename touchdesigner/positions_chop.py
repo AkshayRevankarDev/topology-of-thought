@@ -67,11 +67,22 @@ def onSetupParameters(scriptOp):
     return
 
 
+def _get_graph():
+    """Resolve the live GraphState — held on the graph_store Text DAT module."""
+    store = op('/project1/graph_store')
+    if store is None:
+        return None
+    try:
+        return mod(store).graph
+    except Exception:
+        return None
+
+
 def onCook(scriptOp):
     """Called every cook — populate channels from the live graph."""
     scriptOp.clear()
 
-    graph = op('/project1').fetch('graph', None)
+    graph = _get_graph()
     if graph is None or not graph.nodes:
         # Emit a single zero sample so downstream operators have valid shape.
         for name in ('tx', 'ty', 'tz', 'r', 'g', 'b', 'scale', 'selected'):
