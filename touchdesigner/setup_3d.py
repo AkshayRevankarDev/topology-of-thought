@@ -156,16 +156,16 @@ def build_3d_scene(base_path: str = '/project1') -> None:
              'instancecolor', 'useinstancecolor')
 
     edge_mat = _make(BASE, constantMAT, 'edge_mat', x=900, y=700)
-    _set_par(edge_mat, 'colorr', 0.15)
-    _set_par(edge_mat, 'colorg', 0.70)
+    _set_par(edge_mat, 'colorr', 0.30)
+    _set_par(edge_mat, 'colorg', 0.85)
     _set_par(edge_mat, 'colorb', 1.00)
-    _set_par(edge_mat, 'alpha', 0.85)
+    _set_par(edge_mat, 'alpha', 0.95)
 
     grid_mat = _make(BASE, constantMAT, 'grid_mat', x=1000, y=700)
-    _set_par(grid_mat, 'colorr', 0.08)
-    _set_par(grid_mat, 'colorg', 0.45)
-    _set_par(grid_mat, 'colorb', 0.85)
-    _set_par(grid_mat, 'alpha', 0.35)
+    _set_par(grid_mat, 'colorr', 0.12)
+    _set_par(grid_mat, 'colorg', 0.55)
+    _set_par(grid_mat, 'colorb', 0.95)
+    _set_par(grid_mat, 'alpha', 0.55)
 
     # ------------------------------------------------------------------ #
     # 3. Nodes geometry                                                   #
@@ -227,16 +227,17 @@ def build_3d_scene(base_path: str = '/project1') -> None:
     default_sop = grid_geo.op('torus1')
     if default_sop is not None:
         default_sop.destroy()
-    grid_sop = grid_geo.create(gridSOP, 'grid_sop')
-    _set_par(grid_sop, 'sizex', 30.0)
-    _set_par(grid_sop, 'sizey', 30.0)
-    _set_par(grid_sop, 'rows', 31)
-    _set_par(grid_sop, 'cols', 31)
-    _set_par(grid_sop, 'orient', 0, 'orientation')   # XY plane
+
+    # Grid SOP only outputs filled surfaces (poly/mesh/nurbs/bezier), so we build
+    # the wireframe directly via a Script SOP — clean rows + cols of polylines.
+    grid_sop_dat = _make(BASE, textDAT, 'grid_sop_script', x=600, y=100)
+    grid_sop_dat.text = _GRID_SOP_CODE
+    grid_sop = grid_geo.create(scriptSOP, 'grid_sop')
+    _set_par(grid_sop, 'callbacks', grid_sop_dat.path, 'dat', 'callbackdat')
     grid_sop.render  = True
     grid_sop.display = True
-    # Drop the grid below the globe and orient as floor (rotate 90° around X).
-    _set_par(grid_geo, 'ty', -4.5)
+    # Drop the grid further below so the globe floats clearly above it.
+    _set_par(grid_geo, 'ty', -5.5)
     _set_par(grid_geo, 'rx', 90.0)
     _set_par(grid_geo, 'material', grid_mat.path)
     _set_par(grid_geo, 'render',  True)
@@ -253,10 +254,13 @@ def build_3d_scene(base_path: str = '/project1') -> None:
     _set_par(cam_target, 'tz', 0.0)
 
     cam = _make(BASE, cameraCOMP, 'cam1', x=1200, y=500)
-    _set_par(cam, 'tz', 12.0)
-    _set_par(cam, 'fov',  45.0, 'fovx', 'angle')
+    _set_par(cam, 'tz', 18.0)
+    _set_par(cam, 'fov',  50.0, 'fovx', 'angle')
     # Point at the origin regardless of where we place tx/ty/tz.
     _set_par(cam, 'lookat', cam_target.path)
+    # Tight near plane so the user can dolly *inside* the globe (around-me view)
+    # without geometry getting clipped at the camera.
+    _set_par(cam, 'near', 0.05, 'nearclip')
 
     light = _make(BASE, lightCOMP, 'light1', x=1200, y=400)
     _set_par(light, 'tx', 6.0)
@@ -292,8 +296,8 @@ def build_3d_scene(base_path: str = '/project1') -> None:
 
     glow_blur = _make(BASE, blurTOP, 'glow_blur', x=1500, y=500)
     render3d.outputConnectors[0].connect(glow_blur.inputConnectors[0])
-    # Modest blur — large kernels wipe sparse cyan dots into invisibility.
-    _set_par(glow_blur, 'size', 6.0, 'blursize')
+    # Stronger bloom now that the spheres are bright and dense.
+    _set_par(glow_blur, 'size', 14.0, 'blursize')
 
     glow_add = _make(BASE, addTOP, 'glow_add', x=1600, y=500)
     render3d.outputConnectors[0].connect(glow_add.inputConnectors[0])
@@ -370,12 +374,51 @@ def onCook(scriptOp):
 
 
 # ---------------------------------------------------------------------------
+# Embedded Script SOP — wireframe perspective grid
+# ---------------------------------------------------------------------------
+_GRID_SOP_CODE = '''"""grid_sop — builds an XY-plane wireframe grid as polylines.
+
+Output is N+1 horizontal lines and N+1 vertical lines covering a SIZE x SIZE
+patch centred on the origin. The Geometry COMP rotates this onto the XZ plane
+so it reads as a floor; here we just emit it flat in XY.
+"""
+SIZE  = 30.0    # total extent of the grid (TD units)
+LINES = 31      # number of lines in each direction (=> LINES-1 cells)
+
+def onCook(scriptOp):
+    scriptOp.clear()
+    half = SIZE / 2.0
+    step = SIZE / max(LINES - 1, 1)
+    # Horizontal lines (vary y, x sweeps).
+    for i in range(LINES):
+        y = -half + i * step
+        p1 = scriptOp.appendPoint()
+        p2 = scriptOp.appendPoint()
+        p1.x, p1.y, p1.z = -half, y, 0.0
+        p2.x, p2.y, p2.z =  half, y, 0.0
+        poly = scriptOp.appendPoly(2, closed=False, addPoints=False)
+        poly[0].point = p1
+        poly[1].point = p2
+    # Vertical lines (vary x, y sweeps).
+    for i in range(LINES):
+        x = -half + i * step
+        p1 = scriptOp.appendPoint()
+        p2 = scriptOp.appendPoint()
+        p1.x, p1.y, p1.z = x, -half, 0.0
+        p2.x, p2.y, p2.z = x,  half, 0.0
+        poly = scriptOp.appendPoly(2, closed=False, addPoints=False)
+        poly[0].point = p1
+        poly[1].point = p2
+'''
+
+
+# ---------------------------------------------------------------------------
 # Camera control DAT — module-level state
 # ---------------------------------------------------------------------------
 _CAM_CTL_CODE = '''"""cam_ctl_script — orbit/dolly/idle-spin state for cam1."""
 azimuth   = 25.0
-elevation = 12.0
-distance  = 12.0
+elevation = 5.0
+distance  = 18.0
 
 _dragging   = False
 _last_mx    = 0.0
@@ -383,11 +426,11 @@ _last_my    = 0.0
 _idle_frames = 0          # frames since last drag input
 
 ORBIT_SENS   = 220.0      # deg per normalised screen-unit
-DOLLY_SENS   = 1.2        # units per scroll tick
-MIN_DIST     = 1.5
-MAX_DIST     = 28.0
+DOLLY_SENS   = 1.4        # units per scroll tick
+MIN_DIST     = 0.4        # can dolly inside the globe (radius ~4) for around-me view
+MAX_DIST     = 35.0
 IDLE_FRAMES_TO_SPIN = 120   # ~2 s at 60 fps
-IDLE_SPIN_DEG_PER_FRAME = 0.18
+IDLE_SPIN_DEG_PER_FRAME = 0.15
 '''
 
 
