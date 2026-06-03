@@ -1,35 +1,6 @@
-# --- Python ---
-.venv/
-.venv_td/
-venv/
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# --- macOS ---
-.DS_Store
+# RAG vector store (rebuildable from PDFs; large + machine-specific)
+data/vector_store/
 
-# --- IDE ---
-.vscode/
-.idea/
-*.swp
-
-# --- Project data ---
-# Heavy binaries that the pipeline downloads / generates
-data/hand_landmarker.task
-data/exports/
-data/pdfs/*.pdf
-
-# Allow the sample session JSON so the standalone preview works out of the box.
-# Other session files are local-only.
-data/sessions/*.json
-!data/sessions/attention_is_all_you_need.json
-
-# --- Logs / temp ---
-*.log
-*.tmp
-/tmp/
+# TD .toe automatic backups
+touchdesigner/Backup/

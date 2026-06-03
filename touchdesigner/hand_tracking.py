@@ -103,6 +103,7 @@ _cap: Optional[cv2.VideoCapture] = None
 _detector: Optional[HandLandmarker] = None
 _latest_hands: List[Dict[str, List[Tuple[float, float, float]]]] = []
 _frame_ts: int = 0   # monotonically increasing ms timestamp for LIVE_STREAM
+_latest_frame: Optional[np.ndarray] = None   # cached RGB frame for previewing
 
 
 # ---------------------------------------------------------------------------
@@ -248,17 +249,20 @@ def shutdown() -> None:
 
 
 def read_frame() -> Optional[np.ndarray]:
-    """Grab one RGB frame from the webcam.
+    """Grab one RGB frame from the webcam and cache it for previewing.
 
     Returns:
         H×W×3 uint8 RGB numpy array, or None on failure.
     """
+    global _latest_frame
     if _cap is None:
         return None
     ret, bgr = _cap.read()
     if not ret:
         return None
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    _latest_frame = rgb
+    return rgb
 
 
 def process_frame(rgb: np.ndarray) -> List[Dict[str, List[Tuple[float, float, float]]]]:

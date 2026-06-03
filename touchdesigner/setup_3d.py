@@ -193,12 +193,11 @@ def build_3d_scene(base_path: str = '/project1') -> None:
     _set_par(nodes_geo, 'instancesx', 'scale')
     _set_par(nodes_geo, 'instancesy', 'scale')
     _set_par(nodes_geo, 'instancesz', 'scale')
-    # Per-instance colour channels. TD spells these differently across builds.
-    _set_par(nodes_geo, 'instancecolorr', 'r', 'instancecr', 'instr')
-    _set_par(nodes_geo, 'instancecolorg', 'g', 'instancecg', 'instg')
-    _set_par(nodes_geo, 'instancecolorb', 'b', 'instancecb', 'instb')
-    _set_par(nodes_geo, 'instancecolormode', 'rgb',
-             'instancecolormethod', 'instcolormode')
+    # Per-instance colour: this TD build uses a single CHOP reference
+    # (instancecolorop) + a mode menu, not per-channel pars. The geo reads
+    # the first 3 (or 4) channels matching r/g/b/a from that CHOP.
+    _set_par(nodes_geo, 'instancecolorop', node_pos.path)
+    _set_par(nodes_geo, 'instancecolormode', 'replace')
     _set_par(nodes_geo, 'material', node_mat.path)
     _set_par(nodes_geo, 'render',  True)
     _set_par(nodes_geo, 'display', True)
@@ -270,7 +269,13 @@ def build_3d_scene(base_path: str = '/project1') -> None:
     # ------------------------------------------------------------------ #
     # 7. Orbit/dolly/idle-spin camera controller                          #
     # ------------------------------------------------------------------ #
-    _make(BASE, mouseinCHOP, 'cam_mouse', x=1000, y=600)
+    mouse_chop = _make(BASE, mouseinCHOP, 'cam_mouse', x=1000, y=600)
+    # Mouse In CHOP exposes button/wheel channels ONLY when these par fields
+    # have a name in them. Default is empty = no channel.
+    _set_par(mouse_chop, 'lbuttonname', 'lselect')
+    _set_par(mouse_chop, 'rbuttonname', 'rselect')
+    _set_par(mouse_chop, 'mbuttonname', 'mselect')
+    _set_par(mouse_chop, 'wheel',       'mw')
 
     cam_ctl_dat = _make(BASE, textDAT, 'cam_ctl_script', x=1100, y=600)
     cam_ctl_dat.text = _CAM_CTL_CODE
@@ -315,8 +320,37 @@ def build_3d_scene(base_path: str = '/project1') -> None:
         d = g.par.display.eval() if hasattr(g.par, 'display') else 'NA'
         print(f'[setup_3d] {g.name}: render={r} display={d}')
 
+    # ------------------------------------------------------------------ #
+    # 8b. Webcam preview Script TOP (with landmark dots)                  #
+    # ------------------------------------------------------------------ #
+    cam_preview_dat = _make(BASE, textDAT, 'cam_preview_script', x=600, y=0)
+    cam_preview_dat.text = _CAM_PREVIEW_CODE
+    scriptTOP = td.scriptTOP
+    noiseTOP  = td.noiseTOP
+    # Trigger so the Script TOP re-cooks every frame (same trick as graph_render).
+    preview_trigger = _make(BASE, noiseTOP, 'cam_preview_trigger', x=800, y=-50)
+    _set_par(preview_trigger, 'resolutionw', 16)
+    _set_par(preview_trigger, 'resolutionh', 16)
+    cam_preview_top = _make(BASE, scriptTOP, 'cam_preview', x=900, y=0)
+    _set_par(cam_preview_top, 'callbacks', cam_preview_dat.path, 'dat', 'callbackdat')
+    _set_par(cam_preview_top, 'resolutionw', 640)
+    _set_par(cam_preview_top, 'resolutionh', 480)
+    preview_trigger.outputConnectors[0].connect(cam_preview_top.inputConnectors[0])
+
+    # ------------------------------------------------------------------ #
+    # 9. Re-point gesture_exec at our 3D camera handler                  #
+    # ------------------------------------------------------------------ #
+    gesture_exec = BASE.op('gesture_exec')
+    if gesture_exec is not None:
+        gesture_exec.text = _GESTURE_EXEC_CODE
+        print('[setup_3d] gesture_exec rewired to drive 3D camera')
+    else:
+        print('[setup_3d] NOTE: gesture_exec not found; run td_auto_setup first '
+              'if you want hand-gesture camera control.')
+
     print('[setup_3d] JARVIS HUD ready. View /project1/out3d')
     print('[setup_3d] Drag in cam_mouse to orbit, scroll/pinch to dolly.')
+    print('[setup_3d] Hand gestures: single pinch+drag=orbit, two-hand pinch=zoom.')
     print('[setup_3d] Idle for ~2s and the globe will auto-rotate.')
 
 
@@ -413,6 +447,154 @@ def onCook(scriptOp):
 
 
 # ---------------------------------------------------------------------------
+# Webcam preview Script TOP — shows live feed + landmark overlay
+# ---------------------------------------------------------------------------
+_CAM_PREVIEW_CODE = '''"""cam_preview — displays the latest webcam frame + hand landmarks."""
+import sys as _sys
+_root = r\'''' + str(PROJECT_ROOT) + '''\'
+_venv = r\'''' + str(PROJECT_ROOT / '.venv_td/lib/python3.11/site-packages') + '''\'
+for _p in (_root, _venv):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+import numpy as np
+
+# Skeleton connectivity for MediaPipe hand landmarks (21 points).
+_BONES = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+    (5,9),(9,13),(13,17),
+]
+
+def cook(scriptOp):
+    try:
+        from touchdesigner import hand_tracking as ht
+        import cv2
+    except Exception:
+        # Module not ready — emit a black frame so the TOP still exists.
+        scriptOp.copyNumpyArray(np.zeros((scriptOp.height, scriptOp.width, 4), dtype=np.float32))
+        return
+
+    rgb = ht._latest_frame
+    if rgb is None:
+        scriptOp.copyNumpyArray(np.zeros((scriptOp.height, scriptOp.width, 4), dtype=np.float32))
+        return
+
+    img = rgb.copy()
+    h, w, _ = img.shape
+
+    # Overlay landmarks for each detected hand.
+    for hand in ht._latest_hands or []:
+        lms = hand.get('landmarks', [])
+        if not lms:
+            continue
+        pts = [(int(x * w), int(y * h)) for (x, y, _z) in lms]
+        for a, b in _BONES:
+            if a < len(pts) and b < len(pts):
+                cv2.line(img, pts[a], pts[b], (60, 230, 255), 2)
+        for (px, py) in pts:
+            cv2.circle(img, (px, py), 4, (255, 255, 255), -1)
+        # Highlight the pinch midpoint (thumb tip + index tip).
+        if len(pts) >= 9:
+            mx = (pts[4][0] + pts[8][0]) // 2
+            my = (pts[4][1] + pts[8][1]) // 2
+            cv2.circle(img, (mx, my), 10, (90, 255, 180), 2)
+
+    # Mirror horizontally so user sees a mirror view (Zoom-style).
+    img = np.fliplr(img)
+
+    # Pack into RGBA float32 for TD.
+    rgba = np.dstack([img, np.full((h, w, 1), 255, dtype=np.uint8)])
+    out = (rgba.astype(np.float32) / 255.0)
+    # TD wants row 0 at bottom; numpy has row 0 at top.
+    out = np.flipud(out)
+    scriptOp.copyNumpyArray(np.ascontiguousarray(out))
+'''
+
+
+# ---------------------------------------------------------------------------
+# Gesture Execute DAT — feeds MediaPipe hand events into 3D camera handler
+# ---------------------------------------------------------------------------
+_GESTURE_EXEC_CODE = '''"""gesture_exec — 3D camera control via webcam hand pinch (rewired)."""
+import sys as _sys
+_root = r\'''' + str(PROJECT_ROOT) + '''\'
+_venv = r\'''' + str(PROJECT_ROOT / '.venv_td/lib/python3.11/site-packages') + '''\'
+for _p in (_root, _venv):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+_engine = None
+_import_ok = None
+
+_engine     = None
+_import_ok  = None
+
+def _try_import():
+    global _import_ok, _engine
+    try:
+        from touchdesigner import hand_tracking as ht
+        from touchdesigner.gesture_engine import GestureEngine
+        # Source-of-truth = the module's own _cap. If it's None (fresh import,
+        # or hand_tracking was reloaded), restart the camera. Looser pinch
+        # threshold so casual pinches register.
+        if ht._cap is None:
+            ht.startup()
+            print('[gesture_exec] webcam (re)opened.')
+        if _engine is None:
+            _engine = GestureEngine(close_threshold=0.08, open_threshold=0.12)
+            print('[gesture_exec] GestureEngine ready (close=0.08).')
+        _import_ok = True
+    except Exception as e:
+        _import_ok = False
+        global _err_print
+        try:
+            _err_print
+        except NameError:
+            _err_print = 0
+        import time
+        now = time.time()
+        if now - _err_print > 3.0:
+            print(f'[gesture_exec] WARN: hand pipeline init failed: {e}')
+            _err_print = now
+    return _import_ok
+
+def onStart():
+    _try_import()
+
+def onFrameStart(frame):
+    if not _try_import():
+        return
+    # Drive the MediaPipe inference inline so we don't depend on the
+    # hand_tracker Script CHOP cooking every frame.
+    from touchdesigner import hand_tracking as ht
+    rgb = ht.read_frame()
+    if rgb is not None:
+        ht.process_frame(rgb)
+    hands  = list(ht._latest_hands)
+    events = _engine.update(hands)
+    if not events and not hands:
+        return
+    try:
+        from touchdesigner import interactions
+        interactions.handle_gesture_events(events, hands)
+    except Exception as e:
+        global _last_err
+        try:
+            _last_err
+        except NameError:
+            _last_err = 0
+        import time
+        now = time.time()
+        if now - _last_err > 2.0:
+            print(f'[gesture_exec] handler error: {e}')
+            _last_err = now
+'''
+
+
+# ---------------------------------------------------------------------------
 # Camera control DAT — module-level state
 # ---------------------------------------------------------------------------
 _CAM_CTL_CODE = '''"""cam_ctl_script — orbit/dolly/idle-spin state for cam1."""
@@ -423,6 +605,8 @@ distance  = 18.0
 _dragging   = False
 _last_mx    = 0.0
 _last_my    = 0.0
+_drag_dist  = 0.0         # accumulated drag distance — used to distinguish click vs drag
+_lb_prev    = 0.0         # previous frame's left-button state (rising-edge)
 _idle_frames = 0          # frames since last drag input
 
 ORBIT_SENS   = 220.0      # deg per normalised screen-unit
@@ -431,6 +615,7 @@ MIN_DIST     = 0.4        # can dolly inside the globe (radius ~4) for around-me
 MAX_DIST     = 35.0
 IDLE_FRAMES_TO_SPIN = 120   # ~2 s at 60 fps
 IDLE_SPIN_DEG_PER_FRAME = 0.15
+CLICK_DRAG_THRESHOLD = 0.012   # normalised drag distance below this counts as click
 '''
 
 
@@ -455,25 +640,55 @@ def onFrameStart(frame):
     mw = _chan('mw')
 
     drag_now = lb > 0.5
+    lb_prev  = getattr(ctl, '_lb_prev', 0.0)
 
-    # Orbit on left-drag
-    if drag_now:
-        if not ctl._dragging:
-            ctl._dragging = True
-            ctl._last_mx  = mx
-            ctl._last_my  = my
-        else:
-            dx = mx - ctl._last_mx
-            dy = my - ctl._last_my
-            ctl.azimuth   += dx * ctl.ORBIT_SENS
-            ctl.elevation += dy * ctl.ORBIT_SENS
-            ctl.elevation = max(-85.0, min(85.0, ctl.elevation))
-            ctl._last_mx  = mx
-            ctl._last_my  = my
+    # ---- Press: remember where the click started ----
+    if drag_now and lb_prev <= 0.5:
+        ctl._dragging   = True
+        ctl._last_mx    = mx
+        ctl._last_my    = my
+        ctl._drag_dist  = 0.0
+
+    # ---- Hold: orbit accumulates ----
+    if drag_now and ctl._dragging:
+        dx = mx - ctl._last_mx
+        dy = my - ctl._last_my
+        ctl._drag_dist += abs(dx) + abs(dy)
+        ctl.azimuth   += dx * ctl.ORBIT_SENS
+        ctl.elevation += dy * ctl.ORBIT_SENS
+        ctl.elevation = max(-85.0, min(85.0, ctl.elevation))
+        ctl._last_mx  = mx
+        ctl._last_my  = my
         ctl._idle_frames = 0
-    else:
+
+    # ---- Release: tiny drag total = treat as a click and pick a node ----
+    if (not drag_now) and lb_prev > 0.5 and ctl._dragging:
+        if ctl._drag_dist < ctl.CLICK_DRAG_THRESHOLD:
+            # Mouse In CHOP captures clicks GLOBALLY (textport, network, etc.),
+            # so we only honour clicks whose normalised mouse coords are inside
+            # [0,1] — i.e., the user is inside an active panel viewer.
+            in_panel = 0.0 <= ctl._last_mx <= 1.0 and 0.0 <= ctl._last_my <= 1.0
+            if in_panel:
+                try:
+                    from touchdesigner import interactions
+                    hit = interactions.pick_nearest_in_screen(ctl._last_mx, ctl._last_my)
+                    if hit:
+                        try:
+                            n = mod(op('/project1/graph_store')).graph.get_node(hit)
+                            label = n.label if n else hit[:8]
+                        except Exception:
+                            label = hit[:8]
+                        print(f'[cam_exec] PICKED: "{label}"  (id={hit[:8]})')
+                    # On a miss we DO NOT clear selection — call
+                    # interactions.clear_selection() explicitly from Textport.
+                except Exception as e:
+                    print(f'[cam_exec] pick failed: {e}')
         ctl._dragging = False
+
+    if not drag_now:
         ctl._idle_frames += 1
+
+    ctl._lb_prev = lb
 
     # Dolly on scroll/pinch
     if abs(mw) > 1e-4:

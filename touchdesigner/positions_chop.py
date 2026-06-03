@@ -50,8 +50,10 @@ def _scale_xyz(nx: float, ny: float, nz: float):
     )
 
 
-def _confidence_to_rgb(c: float):
-    """Dim blue-grey → bright sky-blue along the confidence axis."""
+def _confidence_to_rgb(c: float, selected: bool = False):
+    """Selected → bright gold-white, otherwise blue ramp by confidence."""
+    if selected:
+        return 1.00, 0.92, 0.45  # bright gold — JARVIS focus colour
     c = max(0.0, min(1.0, float(c)))
     r = 0.10 + 0.30 * c
     g = 0.40 + 0.50 * c
@@ -95,21 +97,21 @@ def onCook(scriptOp):
     nodes = graph.nodes
     n = len(nodes)
 
-    # Allocate channels.
-    chans = {
-        name: scriptOp.appendChan(name)
-        for name in ('tx', 'ty', 'tz', 'r', 'g', 'b', 'scale', 'selected')
-    }
+    # Allocate channels. TD's Geometry COMP reads per-instance colour from
+    # channels named 'Cd.r', 'Cd.g', 'Cd.b' (Houdini convention).
+    chan_names = ('tx', 'ty', 'tz', 'Cd.r', 'Cd.g', 'Cd.b', 'scale', 'selected')
+    chans = {name: scriptOp.appendChan(name) for name in chan_names}
     scriptOp.numSamples = n
 
     for i, nd in enumerate(nodes):
+        sel = bool(getattr(nd, 'selected', False))
         x, y, z = _scale_xyz(nd.x, nd.y, nd.z)
-        r, g, b = _confidence_to_rgb(getattr(nd, 'confidence', 1.0))
+        r, g, b = _confidence_to_rgb(getattr(nd, 'confidence', 1.0), selected=sel)
         chans['tx'][i] = x
         chans['ty'][i] = y
         chans['tz'][i] = z
-        chans['r'][i] = r
-        chans['g'][i] = g
-        chans['b'][i] = b
-        chans['scale'][i] = 1.0 if not getattr(nd, 'selected', False) else 1.8
-        chans['selected'][i] = 1.0 if getattr(nd, 'selected', False) else 0.0
+        chans['Cd.r'][i] = r
+        chans['Cd.g'][i] = g
+        chans['Cd.b'][i] = b
+        chans['scale'][i] = 2.5 if sel else 1.0
+        chans['selected'][i] = 1.0 if sel else 0.0
