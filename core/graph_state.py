@@ -43,8 +43,10 @@ class Node:
     embedding: Optional[List[float]] = None
     x: float = 0.0
     y: float = 0.0
+    z: float = 0.0
     vx: float = 0.0
     vy: float = 0.0
+    vz: float = 0.0
     pinned: bool = False
     selected: bool = False
     expanded: bool = False
@@ -63,8 +65,10 @@ class Node:
             "embedding": self.embedding,
             "x": self.x,
             "y": self.y,
+            "z": self.z,
             "vx": self.vx,
             "vy": self.vy,
+            "vz": self.vz,
             "pinned": self.pinned,
             "selected": self.selected,
             "expanded": self.expanded,
@@ -83,8 +87,10 @@ class Node:
             embedding=data.get("embedding"),
             x=data.get("x", 0.0),
             y=data.get("y", 0.0),
+            z=data.get("z", 0.0),
             vx=data.get("vx", 0.0),
             vy=data.get("vy", 0.0),
+            vz=data.get("vz", 0.0),
             pinned=data.get("pinned", False),
             selected=data.get("selected", False),
             expanded=data.get("expanded", False),

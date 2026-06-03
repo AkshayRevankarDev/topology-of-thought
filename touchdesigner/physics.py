@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -35,7 +35,11 @@ DEFAULT_DAMPING = 0.83        # Velocity multiplier per tick [0, 1]
 DEFAULT_GRAVITY = 0.009       # Centre-pull strength
 DEFAULT_DT = 1.0              # Time-step
 DEFAULT_MAX_SPEED = 45.0      # Velocity clamp (px/tick)
-DEFAULT_TPS = 60.0            # Ticks per second
+DEFAULT_TPS = 60.0
+
+# Sphere mode defaults
+DEFAULT_SPHERE_RADIUS  = 480.0   # radius in physics-space units
+DEFAULT_SPHERE_CENTER  = (960.0, 540.0, 0.0)   # centred in 1920x1080 plane            # Ticks per second
 
 
 class PhysicsEngine:
@@ -66,6 +70,9 @@ class PhysicsEngine:
         dt: float = DEFAULT_DT,
         max_speed: float = DEFAULT_MAX_SPEED,
         ticks_per_second: float = DEFAULT_TPS,
+        sphere_mode: bool = False,
+        sphere_radius: float = DEFAULT_SPHERE_RADIUS,
+        sphere_center: Tuple[float, float, float] = DEFAULT_SPHERE_CENTER,
     ) -> None:
         """Initialise the physics engine.
 
@@ -93,9 +100,14 @@ class PhysicsEngine:
         self.dt = dt
         self.max_speed = max_speed
         self._interval = 1.0 / ticks_per_second
+        self.sphere_mode = sphere_mode
+        self.sphere_radius = sphere_radius
+        self.sphere_center = np.array(sphere_center, dtype=np.float64)
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        if sphere_mode:
+            self.fibonacci_sphere_init()
 
     # ------------------------------------------------------------------
     # Public API
@@ -135,12 +147,41 @@ class PhysicsEngine:
                     node.vx = 0.0
                     node.vy = 0.0
 
+    def fibonacci_sphere_init(self) -> None:
+        """Place every node uniformly on the surface of the sphere.
+
+        Uses the Fibonacci-lattice construction (golden-angle increment) which
+        gives near-perfectly even coverage for any node count. Velocities are
+        zeroed so the cloth-on-sphere physics starts from rest.
+        """
+        with self._lock:
+            nodes = self.graph.nodes
+            n = len(nodes)
+            if n == 0:
+                return
+            phi = np.pi * (3.0 - np.sqrt(5.0))   # golden angle
+            cx, cy, cz = self.sphere_center
+            R = self.sphere_radius
+            for i, nd in enumerate(nodes):
+                y = 1.0 - (i / max(n - 1, 1)) * 2.0     # y in [-1, 1]
+                radius_at_y = np.sqrt(max(0.0, 1.0 - y * y))
+                theta = phi * i
+                x = np.cos(theta) * radius_at_y
+                z = np.sin(theta) * radius_at_y
+                nd.x = float(cx + x * R)
+                nd.y = float(cy + y * R)
+                nd.z = float(cz + z * R)
+                nd.vx = nd.vy = nd.vz = 0.0
+
     def tick(self) -> None:
         """Advance the simulation by one time-step (thread-safe).
 
         Computes all forces, integrates velocities and positions, and clamps
-        nodes to the canvas boundary.
+        nodes to the canvas boundary (2D mode) or back onto the sphere (3D).
         """
+        if self.sphere_mode:
+            self._tick_sphere()
+            return
         with self._lock:
             nodes = self.graph.nodes
             n = len(nodes)
@@ -199,6 +240,87 @@ class PhysicsEngine:
                 nd.y = float(pos[i, 1])
                 nd.vx = float(vel[i, 0])
                 nd.vy = float(vel[i, 1])
+
+    def _tick_sphere(self) -> None:
+        """3D tick constrained to the sphere surface.
+
+        Same Coulomb + spring forces as 2D, but in 3D, then each node is
+        projected back to ``sphere_radius`` after integration so the layout
+        stays a globe even as connected concepts cluster together.
+        """
+        with self._lock:
+            nodes = self.graph.nodes
+            n = len(nodes)
+            if n == 0:
+                return
+
+            pos = np.array([[nd.x, nd.y, nd.z] for nd in nodes], dtype=np.float64)
+            vel = np.array([[nd.vx, nd.vy, nd.vz] for nd in nodes], dtype=np.float64)
+            forces = np.zeros((n, 3), dtype=np.float64)
+
+            # --- Coulomb repulsion (all pairs, 3D) ---
+            # Repulsion uses chord distance; springs use it too — connected
+            # nodes naturally pull along the surface because forces are then
+            # tangentially projected at integration time.
+            for i in range(n):
+                diff = pos[i] - pos
+                dist = np.linalg.norm(diff, axis=1) + 1e-6
+                dist[i] = 1e6
+                rep = self.repulsion / (dist ** 2)
+                direction = diff / dist[:, None]
+                forces[i] += (rep[:, None] * direction).sum(axis=0)
+
+            # --- Spring attraction along edges (3D) ---
+            id_to_idx = {nd.id: idx for idx, nd in enumerate(nodes)}
+            for edge in self.graph.edges:
+                i = id_to_idx.get(edge.source_id)
+                j = id_to_idx.get(edge.target_id)
+                if i is None or j is None:
+                    continue
+                delta = pos[j] - pos[i]
+                dist = np.linalg.norm(delta) + 1e-6
+                stretch = dist - self.spring_l
+                f = self.spring_k * stretch * (delta / dist)
+                forces[i] += f
+                forces[j] -= f
+
+            # --- Integrate, tangentially project, then snap to sphere ---
+            R = self.sphere_radius
+            C = self.sphere_center
+            for i, nd in enumerate(nodes):
+                if nd.pinned:
+                    vel[i] = 0.0
+                    continue
+                # Tangentially project force (remove radial component) so the
+                # node slides along the sphere surface rather than fighting
+                # the constraint.
+                radial = pos[i] - C
+                rnorm = np.linalg.norm(radial) + 1e-6
+                rhat = radial / rnorm
+                f_tan = forces[i] - rhat * np.dot(forces[i], rhat)
+
+                vel[i] = (vel[i] + f_tan * self.dt) * self.damping
+                speed = np.linalg.norm(vel[i])
+                if speed > self.max_speed:
+                    vel[i] = vel[i] / speed * self.max_speed
+                pos[i] += vel[i] * self.dt
+
+                # Snap back to sphere surface.
+                radial = pos[i] - C
+                rnorm = np.linalg.norm(radial) + 1e-6
+                pos[i] = C + radial / rnorm * R
+                # Kill any remaining radial velocity component.
+                radial = pos[i] - C
+                rhat = radial / (np.linalg.norm(radial) + 1e-6)
+                vel[i] = vel[i] - rhat * np.dot(vel[i], rhat)
+
+            for i, nd in enumerate(nodes):
+                nd.x  = float(pos[i, 0])
+                nd.y  = float(pos[i, 1])
+                nd.z  = float(pos[i, 2])
+                nd.vx = float(vel[i, 0])
+                nd.vy = float(vel[i, 1])
+                nd.vz = float(vel[i, 2])
 
     # ------------------------------------------------------------------
     # Internal

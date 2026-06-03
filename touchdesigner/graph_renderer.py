@@ -55,9 +55,11 @@ NEON_CORE          = (255, 255, 200)       # hot white-blue core
 NODE_COLOR_LO      = ( 60,  20,   0)       # dim blue — low confidence
 NODE_COLOR_HI      = (255, 180,  30)       # electric cyan — high confidence
 
-# Edges
-EDGE_NEON          = (160,  70,   5)       # dim cyan edge line
-EDGE_GLOW          = ( 60,  20,   0)       # edge glow halo
+# Edges — Iron Man neon: wide outer haze → mid glow → hot bright core line.
+EDGE_FAR_GLOW      = ( 80,  30,   0)       # outer haze (wide, dim)
+EDGE_MID_GLOW      = (180,  80,   5)       # mid glow ring
+EDGE_NEON          = (255, 160,  20)       # bright sky-blue core line
+EDGE_HOT           = (255, 230, 120)       # hot white-cyan highlight on strong edges
 
 # Labels
 LABEL_COLOR        = (255, 210,  70)       # bright cyan-white text
@@ -215,6 +217,11 @@ def render_frame(
     selected_id: Optional[str] = None,
     show_labels: bool = True,
     ar: bool = False,
+    sphere_mode: bool = False,
+    cam_yaw: float = 0.0,
+    cam_pitch: float = 0.0,
+    cam_zoom: float = 1.0,
+    cam_target: Tuple[float, float, float] = (960.0, 540.0, 0.0),
 ) -> np.ndarray:
     """Render the knowledge graph to a BGRA uint8 numpy array.
 
@@ -251,14 +258,47 @@ def render_frame(
     # Build pixel positions + depth scale (centre = closer/brighter)
     pos: Dict[str, Tuple[int, int]] = {}
     depth_s: Dict[str, float] = {}
-    for node in nodes:
-        px = int(np.clip(node.x / PHYS_W * width,  0, width  - 1))
-        py = int(np.clip(node.y / PHYS_H * height, 0, height - 1))
-        pos[node.id] = (px, py)
-        dist = ((px - cx_frame) ** 2 + (py - cy_frame) ** 2) ** 0.5
-        t = dist / max(max_dist, 1.0)
-        # centre nodes 1.2×, corner nodes 0.6×
-        depth_s[node.id] = 1.20 - t * 0.60
+
+    if sphere_mode:
+        # 3D → 2D: rotate around Y (yaw) then X (pitch), then perspective-
+        # project. Depth scale uses camera-space z so the globe's back-facing
+        # nodes fade into the void.
+        tx, ty, tz = cam_target
+        cy_, sy_ = np.cos(cam_yaw),   np.sin(cam_yaw)
+        cp_, sp_ = np.cos(cam_pitch), np.sin(cam_pitch)
+        # Camera sits along +z at this distance from the target; controls FOV.
+        cam_dist = 1400.0
+        focal    = 1100.0 * cam_zoom
+        for node in nodes:
+            # Translate to camera target, then rotate Y, then rotate X.
+            x = node.x - tx
+            y = node.y - ty
+            z = node.z - tz
+            # Y-axis rotation (yaw)
+            xr = cy_ * x + sy_ * z
+            zr = -sy_ * x + cy_ * z
+            # X-axis rotation (pitch)
+            yr = cp_ * y - sp_ * zr
+            zr = sp_ * y + cp_ * zr
+            # Translate by camera distance so eye is at origin looking down -z.
+            ze = zr + cam_dist
+            if ze < 1.0:
+                ze = 1.0   # avoid div-by-zero / behind-camera flip
+            px = int(np.clip(cx_frame + xr * focal / ze, -32000, 32000))
+            py = int(np.clip(cy_frame + yr * focal / ze, -32000, 32000))
+            pos[node.id] = (px, py)
+            # Depth scale: nodes closer to camera (small ze) get bigger/brighter.
+            # Normalise so a node at cam_dist (centre of sphere) → 1.0.
+            depth_s[node.id] = float(np.clip(cam_dist / ze, 0.35, 1.6))
+    else:
+        for node in nodes:
+            px = int(np.clip(node.x / PHYS_W * width,  0, width  - 1))
+            py = int(np.clip(node.y / PHYS_H * height, 0, height - 1))
+            pos[node.id] = (px, py)
+            dist = ((px - cx_frame) ** 2 + (py - cy_frame) ** 2) ** 0.5
+            t = dist / max(max_dist, 1.0)
+            # centre nodes 1.2×, corner nodes 0.6×
+            depth_s[node.id] = 1.20 - t * 0.60
 
     # -----------------------------------------------------------------------
     # Neon confidence colour  (BGR, blended by confidence level)
@@ -314,20 +354,32 @@ def render_frame(
                            (*SEL_RING_COLOR, pa), 1, cv2.LINE_AA)
 
     # -----------------------------------------------------------------------
-    # EDGES — thin neon lines with soft outer glow
+    # EDGES — multi-pass neon bloom: wide haze → mid glow → bright core
     # -----------------------------------------------------------------------
     for edge in edges:
         p1 = pos.get(edge.source_id)
         p2 = pos.get(edge.target_id)
         if p1 is None or p2 is None:
             continue
-        af = max(EDGE_ALPHA_MIN, edge.confidence * 0.5)
-        # Glow pass (thick, dim)
-        ga = int(40 * af)
-        cv2.line(canvas, p1, p2, (*EDGE_GLOW, ga), 3, cv2.LINE_AA)
-        # Core line (thin, bright)
-        la = int(160 * af)
-        cv2.line(canvas, p1, p2, (*EDGE_NEON, la), 1, cv2.LINE_AA)
+        # Fade by the dimmer of the two endpoint depth scales — edges to
+        # back-of-sphere nodes dim out naturally.
+        ds_a = depth_s.get(edge.source_id, 1.0)
+        ds_b = depth_s.get(edge.target_id, 1.0)
+        ed   = min(ds_a, ds_b)
+        af   = max(EDGE_ALPHA_MIN, edge.confidence) * ed
+        # Outer haze (wide, soft)
+        cv2.line(canvas, p1, p2,
+                 (*EDGE_FAR_GLOW, int(55 * af)), 7, cv2.LINE_AA)
+        # Mid glow
+        cv2.line(canvas, p1, p2,
+                 (*EDGE_MID_GLOW, int(110 * af)), 4, cv2.LINE_AA)
+        # Bright neon core
+        cv2.line(canvas, p1, p2,
+                 (*EDGE_NEON, int(230 * af)), 2, cv2.LINE_AA)
+        # Hot highlight on high-confidence edges (looks like a charged wire)
+        if edge.confidence > 0.65:
+            cv2.line(canvas, p1, p2,
+                     (*EDGE_HOT, int(180 * af)), 1, cv2.LINE_AA)
 
     # -----------------------------------------------------------------------
     # NODES — neon glowing circles
@@ -378,6 +430,11 @@ def render_to_rgba(
     width: int = 1920,
     height: int = 1080,
     ar: bool = True,
+    sphere_mode: bool = False,
+    cam_yaw: float = 0.0,
+    cam_pitch: float = 0.0,
+    cam_zoom: float = 1.0,
+    cam_target: Tuple[float, float, float] = (960.0, 540.0, 0.0),
     **kwargs,
 ) -> np.ndarray:
     """Render the graph and return a float32 RGBA array for TouchDesigner.
@@ -396,12 +453,19 @@ def render_to_rgba(
     Returns:
         ``(height, width, 4)`` float32 numpy array with RGBA channels.
     """
-    bgra = render_frame(graph, width=width, height=height, ar=ar, **kwargs)
+    bgra = render_frame(
+        graph, width=width, height=height, ar=ar,
+        sphere_mode=sphere_mode,
+        cam_yaw=cam_yaw, cam_pitch=cam_pitch,
+        cam_zoom=cam_zoom, cam_target=cam_target,
+        **kwargs,
+    )
     # render_frame returns BGRA; swap B↔R to get RGBA for TD.
     rgba_u8 = bgra[:, :, [2, 1, 0, 3]]
-    # TD Script TOP expects row 0 at the BOTTOM (OpenGL convention).
-    # OpenCV/NumPy have row 0 at the TOP, so flip vertically.
-    rgba_u8 = np.flipud(rgba_u8)
+    # TD Script TOP displays our array rotated 180° relative to numpy/OpenCV
+    # (combined OpenGL row-order + texture-coordinate convention).
+    # Counter by rotating 180° here so labels read right-side-up in the viewer.
+    rgba_u8 = rgba_u8[::-1, ::-1]
     return (rgba_u8 / 255.0).astype(np.float32)
 
 

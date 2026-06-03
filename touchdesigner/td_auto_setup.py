@@ -25,19 +25,58 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-try:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-except NameError:
-    # exec()'d without __file__ — search upward from project.folder / cwd
-    _found = None
-    for _start in ([Path(project.folder)] if 'project' in dir() else []) + [Path.cwd()]:  # type: ignore[name-defined]
-        for _d in [_start] + list(_start.parents):
-            if (_d / 'td_setup.py').exists() and (_d / 'touchdesigner').is_dir():
-                _found = _d
-                break
-        if _found:
-            break
-    PROJECT_ROOT = _found or Path.cwd()
+def _find_project_root() -> Path:
+    """Locate the topology_of_thought project root reliably.
+
+    When this script is exec()'d from the TD Textport, __file__ is not set
+    and project.folder / cwd both point at TD's app bundle.  We try several
+    strategies in priority order, returning the first that contains both
+    'td_setup.py' and a 'touchdesigner/' subdirectory.
+    """
+    def _is_root(p: Path) -> bool:
+        return (p / 'td_setup.py').exists() and (p / 'touchdesigner').is_dir()
+
+    # 1. Normal import — __file__ is always right.
+    try:
+        candidate = Path(__file__).resolve().parent.parent
+        if _is_root(candidate):
+            return candidate
+    except NameError:
+        pass
+
+    # 2. TD Textport exec — project.folder is the .toe's containing directory.
+    #    Works once a .toe saved inside the project folder is open.
+    try:
+        candidate = Path(project.folder)  # type: ignore[name-defined]  # TD global
+        for d in [candidate] + list(candidate.parents):
+            if _is_root(d):
+                return d
+    except Exception:
+        pass
+
+    # 3. Hardcoded known location (this machine's Desktop/Motion path).
+    hardcoded = Path('/Users/akshaymohanrevankar/Desktop/Motion/topology_of_thought')
+    if _is_root(hardcoded):
+        return hardcoded
+
+    # 4. Walk upward from cwd.
+    for d in [Path.cwd()] + list(Path.cwd().parents):
+        if _is_root(d):
+            return d
+
+    # 5. Search common Desktop/Documents locations for any matching project.
+    for base in (Path.home() / 'Desktop', Path.home() / 'Documents'):
+        for child in base.glob('**/topology_of_thought'):
+            if _is_root(child):
+                return child
+
+    raise RuntimeError(
+        "Cannot locate topology_of_thought project root.\n"
+        "Make sure you are running from the correct folder or that the .toe\n"
+        "is saved inside the project directory."
+    )
+
+PROJECT_ROOT = _find_project_root()
 SESSION_PATH = PROJECT_ROOT / 'data' / 'sessions' / 'attention_is_all_you_need.json'
 TOE_SAVE_PATH = PROJECT_ROOT / 'touchdesigner' / 'topology_of_thought.toe'
 
@@ -78,6 +117,16 @@ for _p in (str(PROJECT_ROOT), str(VENV_SITE)):
 # Base container — build everything inside /project1
 # ---------------------------------------------------------------------------
 BASE = op('/project1')
+
+# Clear any Python objects stored in /project1 from previous setup runs.
+# Old 'graph' and 'physics_engine' entries contain threading.Lock objects
+# which cause TD to fail with a pickle error on .toe save.
+for _key in list(BASE.storage.keys()):
+    try:
+        BASE.unstore(_key)
+    except Exception:
+        pass
+print('[td_auto_setup] Cleared operator storage (prevents pickle errors on save)')
 
 def _make(op_type, name, x=0, y=0):
     """Destroy any existing operator with *name* then create a fresh one.
@@ -145,7 +194,7 @@ print(f'[td_auto_setup] Loaded {len(_nodes)} nodes, {len(_edges)} edges')
 # ---------------------------------------------------------------------------
 nodes_tbl = _make(tableDAT, 'nodes_table', x=-600, y=300)
 nodes_tbl.clear()
-nodes_tbl.appendRow(['id', 'label', 'confidence', 'x', 'y', 'source_paper', 'page_refs'])
+nodes_tbl.appendRow(['id', 'label', 'confidence', 'x', 'y', 'z', 'source_paper', 'page_refs'])
 for _n in _nodes:
     nodes_tbl.appendRow([
         str(_n.get('id', ''))[:12],
@@ -153,6 +202,7 @@ for _n in _nodes:
         f"{float(_n.get('confidence', 1.0)):.3f}",
         f"{float(_n.get('x', 0.0)):.1f}",
         f"{float(_n.get('y', 0.0)):.1f}",
+        f"{float(_n.get('z', 0.0)):.1f}",
         str(_n.get('source_paper', '')),
         str(_n.get('page_refs', [])),
     ])
@@ -173,7 +223,16 @@ for _e in _edges:
 print(f'[td_auto_setup] Table DATs populated')
 
 # ---------------------------------------------------------------------------
-# 3. State Text DAT  (current interaction mode)
+# 3a. Graph store Text DAT — shared module for passing graph between DATs.
+#     Physics exec sets graph_store.graph; render script reads it.
+#     Plain Text DAT module-level vars are never pickled by TD on .toe save.
+# ---------------------------------------------------------------------------
+graph_store_dat = _make(textDAT, 'graph_store', x=-600, y=200)
+graph_store_dat.text = 'graph = None  # set by physics_exec.onStart()'
+print('[td_auto_setup] graph_store Text DAT created')
+
+# ---------------------------------------------------------------------------
+# 3b. State Text DAT  (current interaction mode)
 # ---------------------------------------------------------------------------
 mode_dat = _make(textDAT, 'current_mode', x=-600, y=-100)
 mode_dat.text = 'idle'
@@ -275,6 +334,8 @@ _set_par(noise_trigger, 'resolutionh', 720,  'resy', 'height')
 
 render_top = _make(scriptTOP, 'graph_render', x=100, y=0)
 _set_par(render_top, 'callbacks', render_script_dat, 'dat', 'scriptdat', 'Dat')
+# Resolution is determined by the numpy array we pass to copyNumpyArray() —
+# no resolution parameter needed on the Script TOP itself.
 
 # Wire noise_trigger into graph_render input 0 so every noise frame
 # causes graph_render to re-cook and update its output.
@@ -289,7 +350,16 @@ print('[td_auto_setup] graph_render Script TOP created')
 # ---------------------------------------------------------------------------
 # 7. Physics + session-loader Execute DAT (onStart)
 # ---------------------------------------------------------------------------
-_physics_exec_code = f'''# Physics engine — loads graph on startup, runs simulation in background thread
+_physics_exec_code = f'''# Physics engine — loads graph on startup, runs sphere simulation in background.
+#
+# IMPORTANT: we intentionally do NOT use op('/project1').store() for the graph
+# or engine.  TD tries to pickle all stored objects when saving the .toe, and
+# threading.Lock (inside PhysicsEngine) and large numpy arrays (embeddings in
+# GraphState) both fail pickle.  Instead we expose them as module-level vars
+# so other DATs can reach them via TD's mod[] accessor:
+#
+#     g = mod['/project1/physics_exec'].graph
+#
 import sys as _sys
 _root = r'{PROJECT_ROOT}'
 _venv = r'{VENV_SITE}'
@@ -297,8 +367,11 @@ for _p in (_root, _venv):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
 
+graph  = None   # GraphState — read by render_script via mod[this].graph
+_engine = None  # PhysicsEngine — kept here, never pickled
+
 def onStart():
-    import random
+    global graph, _engine
     import json
     from pathlib import Path
     from core.graph_state import GraphState
@@ -310,38 +383,38 @@ def onStart():
 
     graph = GraphState.from_dict(data)
 
-    # Random initial scatter so nodes are not all at origin.
-    for node in graph.nodes:
-        node.x = random.uniform(100, 1820)
-        node.y = random.uniform(100, 980)
-        node.vx = 0.0
-        node.vy = 0.0
-
-    engine = PhysicsEngine(
+    _engine = PhysicsEngine(
         graph,
         canvas_width=1920,
         canvas_height=1080,
         repulsion=4500,
         spring_k=0.045,
         spring_l=160,
-        damping=0.83,
-        gravity=0.009,
+        damping=0.85,
+        gravity=0.0,
         ticks_per_second=60,
+        sphere_mode=True,
+        sphere_radius=480.0,
+        sphere_center=(960.0, 540.0, 0.0),
     )
-    engine.start()
+    _engine.start()
 
-    op('/project1').store('graph', graph)
-    op('/project1').store('physics_engine', engine)
-    print(f'[physics_exec] Graph ready: {{len(graph.nodes)}} nodes, {{len(graph.edges)}} edges')
+    # Share graph via the graph_store Text DAT module.
+    # Plain module-level variables in Text DATs are never pickled on .toe save.
+    mod(op('/project1/graph_store')).graph = graph
+
+    print(f'[physics_exec] Sphere graph ready: {{len(graph.nodes)}} nodes, {{len(graph.edges)}} edges')
+    print('[physics_exec] Globe auto-rotates; pinch=grab/rotate, hold=decompose, tap=zoom.')
 
 def onExit():
-    engine = op('/project1').fetch('physics_engine', None)
-    if engine is not None:
-        engine.stop()
+    global _engine
+    if _engine is not None:
+        _engine.stop()
+        _engine = None
         print('[physics_exec] Physics engine stopped.')
 
 def onFrameStart(frame):
-    pass  # Physics runs in its own daemon thread; nothing needed per-frame.
+    pass
 '''
 
 physics_exec = _make(executeDAT, 'physics_exec', x=-400, y=-300)
@@ -443,6 +516,25 @@ monitor_top = _make(nullTOP, 'monitor', x=350, y=0)
 # ---------------------------------------------------------------------------
 out_top = _make(outTOP, 'output', x=500, y=0)
 
+# ---------------------------------------------------------------------------
+# 12. Window COMP — opens the globe viewer automatically on .toe load
+# ---------------------------------------------------------------------------
+win_comp = _make(windowCOMP, 'viewer_window', x=700, y=0)
+# TD 2025 Window COMP parameter names (confirmed from live par list):
+# winop    — source TOP operator path
+# drawwindow — open/show the window (True = visible)
+# winoffsetx/y — screen position
+# winw/winh — dimensions
+# borders   — show OS window chrome
+_set_par(win_comp, 'winop',      '/project1/monitor', 'top', 'TOP')
+_set_par(win_comp, 'drawwindow', True,  'open', 'openonstart', 'Drawwindow')
+_set_par(win_comp, 'borders',    False, 'Borders', 'border')
+_set_par(win_comp, 'winw',       1280,  'Winw', 'width')
+_set_par(win_comp, 'winh',       720,   'Winh', 'height')
+_set_par(win_comp, 'winoffsetx', 0,     'winstartx', 'startx')
+_set_par(win_comp, 'winoffsety', 0,     'winstarty', 'starty')
+
+print('[td_auto_setup] viewer_window Window COMP created (opens on start)')
 print('[td_auto_setup] All operators created')
 
 # ---------------------------------------------------------------------------
@@ -487,6 +579,7 @@ _positions = {
     'composite':        ( 200,  200),
     'monitor':          ( 350,  200),
     'output':           ( 500,  200),
+    'viewer_window':    ( 700,  200),
 }
 for _name, (_x, _y) in _positions.items():
     _op = BASE.op(_name)
@@ -506,9 +599,51 @@ except Exception as _e:
     print('  → File → Save As manually to save the .toe')
 
 print('')
-print('=' * 55)
-print('  Topology of Thought — TD network ready')
-print(f'  {len(_nodes)} nodes  |  {len(_edges)} edges')
+print('=' * 60)
+print('  Topology of Thought — Iron Man Globe Mode ready')
+print(f'  {len(_nodes)} nodes  |  {len(_edges)} edges  |  Fibonacci sphere')
+print('  Globe auto-rotates on Y axis when idle (~12°/sec).')
+print('  Pinch + drag in empty space  → spin the globe')
+print('  Quick pinch on a node        → zoom toward it')
+print('  Long pinch on a node (1.5s)  → Ollama decomposition')
 print('  Physics starts automatically on next TD launch.')
+print('  Viewer window opens automatically on .toe load.')
+print('  Manual open: right-click viewer_window → Open Window')
+print('  Fullscreen inside viewer: press F')
 print('  Open OPEN_IN_TD.command to reopen this project.')
-print('=' * 55)
+print('=' * 60)
+
+# Trigger physics onStart immediately so graph is loaded without a TD restart.
+try:
+    mod(op('/project1/physics_exec')).onStart()
+    print('[td_auto_setup] Physics started — graph loaded into graph_store.')
+except Exception as _e:
+    print(f'[td_auto_setup] Note: physics auto-start failed: {_e}')
+    print('[td_auto_setup] Run: mod(op(\'/project1/physics_exec\')).onStart()')
+
+# Open the window immediately in this session (don't wait for restart).
+# TD 2025 Window COMP: try par.winopen pulse first, fall back to openViewer().
+try:
+    _win = BASE.op('viewer_window')
+    if _win is not None:
+        _opened = False
+        for _attr in ('winopen', 'open', 'Open', 'Winopen'):
+            try:
+                getattr(_win.par, _attr).pulse()
+                _opened = True
+                break
+            except Exception:
+                pass
+        if not _opened:
+            try:
+                _win.openViewer()
+                _opened = True
+            except Exception:
+                pass
+        if _opened:
+            print('[td_auto_setup] Viewer window opened.')
+        else:
+            raise RuntimeError('no working open method found')
+except Exception as _e:
+    print(f'[td_auto_setup] Note: auto-open failed ({_e})')
+    print('[td_auto_setup] In the network: right-click viewer_window → Open Window')

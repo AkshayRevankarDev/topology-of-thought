@@ -324,6 +324,41 @@ save_session(graph, name='my_session')
 
 ---
 
+## 3D / "Iron Man" globe view (MVP)
+
+After `td_auto_setup.py` has run and `graph_store.graph` is populated, build
+the 3D scene from the Textport:
+
+```python
+from touchdesigner import setup_3d
+setup_3d.build_3d_scene()
+```
+
+This creates, under `/project1`:
+
+- `node_positions` / `edge_positions` — Script CHOPs that surface the live
+  3D positions written by the sphere-mode `PhysicsEngine`.
+- `nodes_geo` — Geometry COMP, small Sphere SOP instanced per node.
+- `edges_geo` — Geometry COMP, Script SOP that builds one polyline per edge.
+- `cam1`, `light1` — orbit camera + key light.
+- `cam_mouse` (Mouse In CHOP) + `cam_exec` (Execute DAT, onFrameStart) —
+  drag-to-orbit, scroll/pinch-to-dolly.
+- `render3d` (Render TOP, 1280×720), composited over `webcam_in` via
+  `composite3d` (Over TOP) for AR passthrough, then `out3d`.
+
+**Controls (MVP):**
+
+| Gesture | Action |
+|---|---|
+| Left-drag in `cam_mouse`'s panel | Orbit (azimuth / elevation) |
+| Scroll / two-finger pinch | Dolly (zoom in/out) |
+| Decrease distance below 3.0 | Camera ends up *inside* the globe → "around me" |
+
+Webcam-hand-tracking gestures (pinch/grab) layer on later via the existing
+`gesture_engine.py` + `hand_tracking.py` modules.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
